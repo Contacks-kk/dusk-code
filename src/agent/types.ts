@@ -1,3 +1,5 @@
+import type { AssistantMessage } from "@mariozechner/pi-ai";
+
 export type StepType = 
 "thought" | 
 "thinking_delta" | 
@@ -59,6 +61,7 @@ export interface GenerationCall {
     toolCallCount: number;
     sideEffectStarted: boolean;
     error?: string;
+    response?: AssistantMessage;
 }
 
 export interface GenerationAttempt {

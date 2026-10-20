@@ -13,6 +13,7 @@ import { buildSystemPrompt } from "../agent/prompt";
 import { permissionManager } from "../agent/runtime/permission-manager";
 import { modelConfigManager } from "../agent/runtime/model-config";
 import { loadImageAsImageContent } from "../utils/image";
+import { restoreRecordedMessages } from "../agent/context/history";
 
 export class AgentService {
     /** 将数据库中的历史消息转换为 Pi Agent 可理解的上下文格式，支持多模态图片还原与工具调用分组规整 */
@@ -20,6 +21,7 @@ export class AgentService {
         const agentMessages: AgentMessage[] = [];
 
         for (const item of dbHistory) {
+            const recordedMessages = restoreRecordedMessages(item);
             let pendingToolCalls: Array<{ id: string; tool: string; args: any }> = [];
 
             /** 冲刷并生成包含并行 toolCall 块的单个 AssistantMessage */
@@ -51,6 +53,7 @@ export class AgentService {
             };
 
             for (const msg of item.messages) {
+                if (recordedMessages !== undefined && msg.role !== "user") continue;
                 const msgTime = msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now();
 
                 // 用户输入消息
@@ -157,6 +160,7 @@ export class AgentService {
                 }
             }
             flushPendingToolCalls(Date.now());
+            if (recordedMessages !== undefined) agentMessages.push(...recordedMessages);
         }
 
         return agentMessages;
@@ -195,15 +199,19 @@ export class AgentService {
             targetSession = await sessionService.createSession(initialTitle, opts.projectId);
         }
 
-        // 2. 加载该 Session 的原始历史并进行分级上下文衰减裁剪（25K 上限与双水位保障）
+        // 2. 加载该 Session 的原始历史并进行分级上下文衰减裁剪（128K 上限与双水位保障）
         const rawHistory = await sessionService.getSessionHistory(targetSession.id);
         const persistentContent = imagePaths.length > 0
             ? JSON.stringify({ text: userInput, imagePaths })
             : userInput;
+
+        // 2.1 估算此次输入的tokens数，用于后续上下文预算
         const inputTokens = estimateTokenCount(persistentContent);
+
+        // 2.2 裁剪原始历史，保留足够的可理解的上下文（考虑预留给输出的最大token数）
         const safeHistory = pruneHistoryContext(rawHistory, inputTokens);
 
-        // 2.1 将数据库中的历史消息转换为 Pi Agent 可理解的上下文格式
+        // 2.3 将数据库中的历史消息转换为 Pi Agent 可理解的上下文格式
         const initialMessages = await this.convertDbMessagesToAgent(safeHistory);
 
         // 3. 计算本轮 turn 序号并写入 turn 表
@@ -236,12 +244,17 @@ export class AgentService {
             generationTimeoutMs: modelConfig.generationTimeoutMs,
             initialMessages,
             onStep: opts.onStep,
-            onAskPermission: opts.onAskPermission
+            onAskPermission: opts.onAskPermission,
+            /** 在下一次请求或工具执行前保存本次调用快照 */
+            onExecution: snapshot => {
+                db.update(turn).set({ executionJson: snapshot }).where(eq(turn.id, createdTurn.id)).run();
+            }
         });
 
+        // 6. 编排状态机恢复算法并返回可持久化的最终执行结果
         const output = await runner.run(userInput, imageContents);
 
-        // 6. 持久化工具调用过程及最终助手回复
+        // 7. 持久化工具调用过程及最终助手回复
         for (const step of output.contextSteps) {
             if (step.type === "tool_call") {
                 db.insert(message).values({
@@ -280,7 +293,7 @@ export class AgentService {
         /** 无论是否产生正文，都保存本轮尝试、用量与结束状态 */
         db.update(turn).set({ executionJson: output.execution }).where(eq(turn.id, createdTurn.id)).run();
 
-        // 7. 更新 Session 的最后活跃时间
+        // 8. 更新 Session 的最后活跃时间
         await sessionService.updateSession(targetSession.id, { updatedAt: new Date() });
 
         return {

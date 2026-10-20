@@ -1,14 +1,6 @@
 import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
-import { estimateTokenCount } from "./token";
-
-/** 估算一条多模态消息的上下文用量 */
-export function messageTokens(message: AgentMessage): number {
-    if (typeof message.content === "string") {
-        return 4 + estimateTokenCount(message.content);
-    }
-    return 4 + message.content.reduce((total, block: any) => total + (block.type === "image" ? 1000 :
-        estimateTokenCount(block.text ?? block.thinking ?? JSON.stringify(block))), 0);
-}
+import { estimateTokenCount, messageTokens } from "./token";
+export { messageTokens } from "./token";
 
 /** 按完整历史轮次裁剪上下文并为本轮输入预留空间 */
 export function fitHistory(history: AgentMessage[], promptTokens: number, systemPrompt: string,

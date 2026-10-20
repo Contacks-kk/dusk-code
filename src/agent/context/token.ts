@@ -1,3 +1,6 @@
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { restoreRecordedMessages } from "./history";
+
 /** 估算纯文本内容的 Token 消耗量 */
 export function estimateTokenCount(text?: string | null): number {
     if (!text) {
@@ -30,16 +33,28 @@ export function estimateTokenCount(text?: string | null): number {
     return Math.max(1, cjkTokens + nonCjkTokens);
 }
 
-/** 估算单轮消息或整体会话的历史记录所占用的 Token 总量 */
+/** 估算一条多模态消息及完整思考内容的上下文用量 */
+export function messageTokens(message: AgentMessage): number {
+    if (typeof message.content === "string") return 4 + estimateTokenCount(message.content);
+    return 4 + message.content.reduce((total, block: any) => total + (block.type === "image" ? 1000 :
+        estimateTokenCount(block.text ?? block.thinking ?? JSON.stringify(block))), 0);
+}
+
+/** 按实际回放内容估算历史用量，排除仅归档的重试快照 */
 export function estimateHistoryTokens(history: Array<{ turn: any; messages: any[] }>): number {
     let total = 0;
 
     for (const item of history) {
         // 每轮 turn 的基础包装协议开销（角色标记、边界等）约预留 4 个 token
         total += 4;
+        const recordedMessages = restoreRecordedMessages(item);
         for (const msg of item.messages) {
+            if (recordedMessages !== undefined && msg.role !== "user") continue;
             total += 3; // 单条 message 协议头部开销
             total += estimateTokenCount(msg.content);
+        }
+        if (recordedMessages !== undefined) {
+            total += recordedMessages.reduce((sum, msg) => sum + messageTokens(msg), 0);
         }
     }
 

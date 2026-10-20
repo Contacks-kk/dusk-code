@@ -58,7 +58,7 @@ export function detectTruncationStage(
 
 /** 判断当前模型与 API 是否支持跨轮次复用未完成的推理思考状态 */
 export function canReuseReasoningState(_model: string): boolean {
-    // 当前 OpenAI-compatible 与 MiMo 协议在 input messages 中传入非标准 thinking 块会报 400，默认不支持
+    /** 回传历史思考不等于恢复供应商内部推理状态，当前不启用精确续推 */
     return false;
 }
 
