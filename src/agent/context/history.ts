@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExecutionRecord } from "../types";
+import { createHash } from "node:crypto";
 
 export interface StoredHistoryTurn {
     turn: { executionJson?: ExecutionRecord | null };
@@ -12,17 +13,32 @@ function isRuntimeReply(content: string): boolean {
     return /^⚠️\s*(?:\*\*)?(?:模型|运行时|执行记录持久化)/.test(content);
 }
 
-/** 使用最终尝试的响应快照与已保存工具结果还原有效助手历史 */
+/** 为有效调用生成跨尝试唯一且符合协议的工具标识 */
+export function historyToolId(attemptNo: number, callNo: number, id: string): string {
+    return `dusk_a${attemptNo}_c${callNo}_${createHash("sha256").update(id).digest("hex").slice(0, 20)}`;
+}
+
+/** 使用有效调用链的响应快照与已保存工具结果还原历史 */
 export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[] | undefined {
-    const calls = item.turn.executionJson?.attempts.at(-1)?.calls;
-    if (!calls?.some(call => call.response)) return undefined;
-    const responses = calls.map(call => call.response).filter((response): response is AssistantMessage => Boolean(response));
+    const execution = item.turn.executionJson;
+    const linked = execution?.effectiveCallRefs !== undefined;
+    const calls = linked ? execution.effectiveCallRefs.flatMap(ref => {
+        const call = execution.attempts.find(attempt => attempt.attemptNo === ref.attemptNo)?.calls.find(call => call.callNo === ref.callNo);
+        return call?.response && call.phase !== "streaming" ? [{ ...ref, response: call.response }] : [];
+    }) : (execution?.attempts.at(-1)?.calls ?? []).filter(call => call.response).map(call => ({
+        attemptNo: execution.attempts.at(-1).attemptNo, callNo: call.callNo, response: call.response
+    }));
+    if (!calls.length) {
+        return linked ? [] : undefined;
+    }
     const results = new Map<string, AgentMessage & { role: "toolResult" }>();
     for (const saved of item.messages) {
         if (saved.role !== "tool_result") continue;
         try {
             const parsed = JSON.parse(saved.content);
-            if (!parsed.id || !parsed.tool) continue;
+            if (!parsed.id || !parsed.tool) {
+                continue;
+            }
             const text = Array.isArray(parsed.result?.content)
                 ? parsed.result.content.map((block: any) => block.text || "").join("\n")
                 : typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result) ?? "";
@@ -38,15 +54,23 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
     const savedReply = item.messages.filter(saved => saved.role === "assistant" && !isRuntimeReply(saved.content)).at(-1)?.content;
     const messages: AgentMessage[] = [];
     let replyRestored = false;
-    for (const [index, response] of responses.entries()) {
-        const last = index === responses.length - 1;
-        if (response.stopReason !== "stop" && response.stopReason !== "toolUse" && !(last && response.stopReason === "length")) continue;
-        const toolCalls = response.content.filter(block => block.type === "toolCall");
+    for (const [index, source] of calls.entries()) {
+        const { response } = source;
+        const last = index === calls.length - 1;
+        if (response.stopReason !== "stop" && response.stopReason !== "toolUse" && !((linked || last) && response.stopReason === "length")) {
+            continue;
+        }
+        const restored = structuredClone(response);
+        if (linked) {
+            for (const block of restored.content) {
+                if (block.type === "toolCall") block.id = historyToolId(source.attemptNo, source.callNo, block.id);
+            }
+        }
+        const toolCalls = restored.content.filter(block => block.type === "toolCall");
         const paired = response.stopReason !== "length" && toolCalls.every(block =>
             results.get(block.id)?.toolName === block.name);
-        const restored = structuredClone(response);
         restored.content = restored.content.filter(block => block.type !== "toolCall" || paired);
-        if (last && toolCalls.length === 0 && savedReply) {
+        if (!linked && last && toolCalls.length === 0 && savedReply) {
             /** 最终正文沿用已落库的聚合结果，思考与签名仍来自真实响应 */
             restored.content = [...restored.content.filter(block => block.type !== "text"), { type: "text", text: savedReply }];
             replyRestored = true;
@@ -58,11 +82,13 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
             messages.push(restored);
         }
         if (paired) {
-            for (const block of toolCalls) messages.push(structuredClone(results.get(block.id)!));
+            for (const block of toolCalls) {
+                messages.push(structuredClone(results.get(block.id)!));
+            }
         }
     }
-    if (savedReply && !replyRestored) {
-        const last = responses.at(-1)!;
+    if (!linked && savedReply && !replyRestored) {
+        const last = calls.at(-1)!.response;
         messages.push({ ...structuredClone(last), content: [{ type: "text", text: savedReply }],
             stopReason: item.turn.executionJson?.status === "completed" ? "stop" : "length" });
     }

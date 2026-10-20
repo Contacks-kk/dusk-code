@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { RunStatus, GenerationAttempt } from "../types";
+import { findLastAssistant } from "./truncation-recovery";
 
 /** 响应内容可用性分级（从高到低） */
 export type ResponseQuality =
@@ -25,8 +26,7 @@ function extractText(message?: AssistantMessage): string {
     return message.content
         .filter(block => block.type === "text")
         .map(block => block.text)
-        .join("\n")
-        .trim();
+        .join("");
 }
 
 /** 从助手消息块中提取思考文本总字符数 */
@@ -43,35 +43,12 @@ function extractToolCallCount(message?: AssistantMessage): number {
     return message.content.filter(block => block.type === "toolCall").length;
 }
 
-/** 从消息序列中定位最后一条助手消息 */
-function findLastAssistant(messages: AgentMessage[]): AssistantMessage | undefined {
-    return messages
-        .filter((m): m is AssistantMessage => m.role === "assistant")
-        .at(-1);
-}
-
-/** 对被截断的正文进行自愈修剪与闭合处理 */
-function cleanTruncatedText(text: string): { text: string; healedBlock: boolean } {
-    if (!text) return { text, healedBlock: false };
-
-    // 检查是否有未闭合的代码块围栏 (奇数个 ```)
-    const fences = text.match(/```/g);
-    let healedBlock = false;
-    let result = text;
-    if (fences && fences.length % 2 !== 0) {
-        result = result.trimEnd() + "\n```";
-        healedBlock = true;
-    }
-
-    return { text: result.trim(), healedBlock };
-}
-
 /** 从模型生成结果中尽最大努力打捞可用内容 */
 export function salvageResponse(
     messages: AgentMessage[],
     summary: GenerationAttempt
 ): SalvagedContent {
-    const lastAssistant = findLastAssistant(messages);
+    const lastAssistant = findLastAssistant(messages, summary);
     const rawText = extractText(lastAssistant);
     const thinkingChars = extractThinkingChars(lastAssistant);
     const toolCallCount = extractToolCallCount(lastAssistant);
@@ -114,7 +91,7 @@ export function salvageResponse(
     }
 
     // 有正文且未被截断 → 完整响应
-    if (!isTruncated) {
+    if (summary.status === "completed") {
         return {
             quality: "complete",
             text: rawText,
@@ -124,16 +101,14 @@ export function salvageResponse(
         };
     }
 
-    // 有正文但被截断 → 清洗与自愈后作为部分可用内容返回
-    const { text: cleaned, healedBlock } = cleanTruncatedText(rawText);
-    const healingNote = healedBlock ? "，已自动闭合未结束代码块" : "";
+    // 原始正文用于续写和落库，展示层不修改其空白及代码围栏
     return {
         quality: "partial_text",
-        text: cleaned,
+        text: rawText,
         thinkingChars,
         toolCallCount,
-        hasUsableContent: cleaned.length > 0,
-        truncationNote: `正文在 ${rawText.length} 字符处被截断（思考消耗 ${thinkingChars.toLocaleString()} 字符）${healingNote}`
+        hasUsableContent: rawText.length > 0,
+        truncationNote: isTruncated ? `正文在 ${rawText.length} 字符处被截断（思考消耗 ${thinkingChars.toLocaleString()} 字符）` : "生成未正常完成，已有正文已保存"
     };
 }
 
@@ -152,7 +127,10 @@ export function composeReply(
         }
 
         // 部分正文：附加截断提示标签与接续指引
-        const note = salvaged.truncationNote || "正文在输出上限处被截断";
+        const note = status === "aborted" ? "生成已取消，已有正文已保存" :
+            status === "timeout" ? "生成已超时，已有正文已保存" :
+            status === "failed" ? contextError || "生成发生异常，已有正文已保存" :
+            salvaged.truncationNote || "正文在输出上限处被截断";
         return `${salvaged.text}\n\n---\n⚠️ **生成未完成** — ${note}。您可以输入「继续」让模型接续未完成的部分。`;
     }
 
@@ -166,9 +144,7 @@ export function composeReply(
             const thinkNote = salvaged.thinkingChars > 0
                 ? `思考阶段消耗 ${salvaged.thinkingChars.toLocaleString()} 字符`
                 : "";
-            const sideEffect = summary?.sideEffectStarted
-                ? "本轮已开始执行变更，为避免重复操作未自动重试。"
-                : "已停止自动恢复。";
+            const sideEffect = "已停止自动恢复。";
             return `⚠️ 模型生成未完成：达到输出上限 ${summary?.maxTokens} token（${usage}）${thinkNote ? `，${thinkNote}` : ""}，结束原因 length。${sideEffect}${contextError ? ` ${contextError}` : ""}`;
         }
         case "timeout": {
@@ -197,7 +173,7 @@ export function composeIncompleteReport(
 
     return `${prefix}⚠️ **模型生成未完全结束（已停止自动恢复）**
 - **中断阶段**：${stageDesc}
-- **恢复尝试**：已自动执行 ${recoveryStepsCount} 轮自愈恢复，已达恢复上限（输出预算 ${summary?.maxTokens ?? 131072} token）
+- **恢复尝试**：已自动执行 ${recoveryStepsCount} 次恢复（单次输出预算 ${summary?.maxTokens ?? "未知"} token）
 - **状态统计**：${thinkInfo ? `${thinkInfo}，` : ""}已打捞保存已有可见产出
 💡 **建议**：您可以输入「继续」在当前基础上无缝接续，或输入 \`/model\` 调整思考预算与配置。`;
 }

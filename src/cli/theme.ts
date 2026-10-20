@@ -213,16 +213,13 @@ export function renderCrunchedSummary(totalMs: number): void {
     console.log(`\n${colors.cyan}✻ Crunched for ${formatDuration(totalMs)}${colors.reset}\n`);
 }
 
-/** 实时流式渲染 Agent 调用链的单步状态变化（Claude Code 树形结构与固定高度视口） */
+/** 渲染思考、工具和中间回复，隐藏内部循环编号 */
 export function renderLiveStep(step: AgentExecutionStep): void {
     const turnNo = step.turnNo ?? 1;
 
     if (step.type === "turn_start") {
         rollingTicker.flush();
         turnHistoryManager.recordTurnStart(turnNo);
-        turnHistoryManager.recordTurnStartLine(turnNo);
-        turnHistoryManager.recordOutputLines(2);
-        console.log(`\n${colors.cyan}${colors.bold}◆ Loop Turn ${turnNo}${colors.reset} ${colors.gray}${colors.dim}[Ctrl+O 展开 · /turn 详情]${colors.reset}`);
     } else if (step.type === "thinking_delta") {
         if (step.delta) {
             turnHistoryManager.appendThinking(turnNo, step.delta);
@@ -236,10 +233,9 @@ export function renderLiveStep(step: AgentExecutionStep): void {
     } else if (step.type === "intermediate_text") {
         rollingTicker.flush();
         turnHistoryManager.recordIntermediateText(turnNo, step.content ?? "");
-        const turnLabel = ` (Turn ${turnNo})`;
         const md = renderMarkdown(step.content ?? "");
         turnHistoryManager.recordOutputLines(countScreenLines(md) + 3);
-        console.log(`\n${colors.magenta}● Assistant${turnLabel}${colors.reset}\n`);
+        console.log(`\n${colors.magenta}● Assistant${colors.reset}\n`);
         console.log(md);
     } else if (step.type === "tool_call") {
         rollingTicker.flush();
@@ -248,9 +244,8 @@ export function renderLiveStep(step: AgentExecutionStep): void {
             name: step.toolName || "tool",
             args: step.args || {}
         });
-        const turnPrefix = `${colors.gray}[Turn ${turnNo}] ${colors.reset}`;
         turnHistoryManager.recordOutputLines(2);
-        console.log(`\n${turnPrefix}${formatToolHeader(step.toolName || "tool", step.args)}`);
+        console.log(`\n${formatToolHeader(step.toolName || "tool", step.args)}`);
     } else if (step.type === "tool_result") {
         rollingTicker.flush();
         turnHistoryManager.recordToolResult(
@@ -261,7 +256,7 @@ export function renderLiveStep(step: AgentExecutionStep): void {
             step.isError
         );
         const branchLine = formatToolBranchResult(step.toolName || "tool", step.result, step.durationMs, step.isError);
-        const hint = ` ${colors.dim}[输入 /turn ${turnNo} 查看完整响应]${colors.reset}`;
+        const hint = ` ${colors.dim}[输入 /turn 查看完整响应]${colors.reset}`;
         turnHistoryManager.recordOutputLines(1);
         console.log(`${branchLine}${hint}`);
     } else if (step.type === "turn_end") {
@@ -340,7 +335,7 @@ ${colors.cyan}${colors.bold}DUSK CLI 命令指引${colors.reset}
   ${colors.yellow}/plan <任务需求>${colors.reset}        显式进入规划模式，深入只读调研代码并输出实施计划
   ${colors.yellow}/permissions [mode]${colors.reset}    查看或切换权限: read-only | workspace | full-access
   ${colors.yellow}/compact${colors.reset}               显式压缩当前会话上下文，释放 Token 消耗
-  ${colors.yellow}/turn [n]${colors.reset}              交互式展开指定轮次的完整思考过程、工具调用与响应结果
+  ${colors.yellow}/turn [n]${colors.reset}              查看执行记录的完整思考过程、工具调用与响应结果
   ${colors.yellow}/resume [id]${colors.reset}           列出当前项目历史会话，或按 ID 恢复指定会话
   ${colors.yellow}/new${colors.reset}                   开启当前项目下的全新会话
   ${colors.yellow}/help${colors.reset}                  显示本帮助指南

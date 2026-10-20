@@ -50,6 +50,7 @@ export interface GenerationUsage {
 }
 
 export interface GenerationCall {
+    phase?: "streaming" | "finished";
     callNo: number;
     maxTokens: number;
     status: RunStatus;
@@ -78,6 +79,9 @@ export interface GenerationAttempt {
 }
 
 export interface ExecutionRecord {
+    phase?: "running" | "recovering" | "finished";
+    effectiveCallRefs?: Array<{ attemptNo: number; callNo: number }>;
+    pendingToolCallIds?: string[];
     status: RunStatus;
     error?: string;
     config: {
@@ -95,6 +99,7 @@ export interface ExecutionRecord {
 }
 
 export interface AgentExecutionStep {
+    callNo?: number;
     type: StepType;
     content?: string;
     delta?: string;

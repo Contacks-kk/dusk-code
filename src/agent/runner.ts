@@ -3,20 +3,17 @@ import { createAssistantMessageEventStream, streamSimple, type AssistantMessage,
 import type { AgentExecutionStep, ExecutionRecord, GenerationAttempt, GenerationCall, GenerationUsage, RunStatus } from "./types";
 import { toolRegistry } from "./tools/registry";
 import { permissionManager, READ_TOOLS } from "./runtime/permission-manager";
-import { generationPolicy, isMiMoModel, escalateBudget, type GenerationPolicy, type ReasoningEffort } from "./runtime/generation-policy";
+import { generationPolicy, isMiMoModel, type GenerationPolicy, type ReasoningEffort } from "./runtime/generation-policy";
 import { fitHistory } from "./context/budget";
-import { estimateTokenCount } from "./context/token";
+import { messageTokens } from "./context/token";
+import { historyToolId, restoreRecordedMessages } from "./context/history";
 import { prepareModelRequest } from "./runtime/model-adapter";
 import { salvageResponse, composeReply, composeIncompleteReport, type ResponseQuality, type SalvagedContent } from "./runtime/response-salvager";
 import {
     detectTruncationStage,
-    canReuseReasoningState,
-    generateThinkingCheckpoint,
-    buildContinuationPrompt,
-    buildCheckpointPrompt,
-    aggregateTextChunks,
-    sanitizeIncompleteToolCalls,
-    thinkingOf
+    buildRecoveryPrompt,
+    buildContextCheckpoint,
+    aggregateTextChunks
 } from "./runtime/truncation-recovery";
 
 export interface RunnerOptions extends Partial<GenerationPolicy> {
@@ -30,7 +27,8 @@ export interface RunnerOptions extends Partial<GenerationPolicy> {
     tools?: AgentTool<any>[];
     onStep?: (step: AgentExecutionStep) => void;
     onAskPermission?: (prompt: string) => Promise<boolean>;
-    onExecution?: (snapshot: ExecutionRecord) => void;
+    onExecution?: (snapshot: ExecutionRecord, settledSteps?: AgentExecutionStep[]) => void;
+    signal?: AbortSignal;
 }
 
 export interface RunnerOutput {
@@ -49,7 +47,7 @@ export interface RunnerOutput {
 }
 
 /** 提取指定助手消息中的正文 */
-const textOf = (message?: AssistantMessage): string => message?.content.filter(block => block.type === "text").map(block => block.text).join("\n").trim() ?? "";
+const textOf = (message?: AssistantMessage): string => message?.content.filter(block => block.type === "text").map(block => block.text).join("") ?? "";
 /** 创建未获得供应商统计时的用量记录 */
 const unknownUsage = (): GenerationUsage => ({ inputTokens: null, outputTokens: null, reasoningTokens: null, cacheReadTokens: null, totalTokens: null });
 
@@ -70,6 +68,7 @@ export class AgentRunner {
     private readonly contextWindow: number;
     private readonly steps: AgentExecutionStep[] = [];
     private persistenceError?: string;
+    private originalUser?: AgentMessage;
 
     /** 保存本轮模型连接与生成策略 */
     constructor(private readonly options: RunnerOptions) {
@@ -99,9 +98,27 @@ export class AgentRunner {
     }
 
     /** 为当前输出预算保留可容纳的完整历史轮次 */
-    private historyFor(prompt: string, images: ImageContent[] | undefined, maxTokens: number): AgentMessage[] {
-        return fitHistory(this.options.initialMessages ?? [], estimateTokenCount(prompt) + (images?.length ?? 0) * 1000,
-            this.systemPrompt, this.tools, this.contextWindow, maxTokens);
+    private historyFor(history: AgentMessage[], pinned: AgentMessage[], maxTokens: number): AgentMessage[] {
+        /** 按整轮裁剪旧历史，同时固定本轮需求与有效进展 */
+        const fit = (current: AgentMessage[]) => [...fitHistory(history, current.reduce((sum, message) => sum + messageTokens(message), 0),
+            this.systemPrompt, this.tools, this.contextWindow, maxTokens), ...current];
+        try { return fit(pinned); }
+        catch (error) {
+            if (!this.originalUser) throw error;
+            for (let chars = 8192; chars >= 256; chars = Math.floor(chars / 2)) {
+                const checkpoint = buildContextCheckpoint(pinned, chars);
+                if (!checkpoint) continue;
+                const lastUser = pinned.filter(message => message.role === "user").at(-1);
+                const current: AgentMessage[] = [this.originalUser, { role: "user", content: checkpoint, timestamp: Date.now() }];
+                if (lastUser && lastUser !== this.originalUser) current.push(lastUser);
+                try {
+                    const fitted = fit(current);
+                    this.emit({ type: "status", content: "本轮上下文达到预算，已保留原始需求与执行结果检查点继续；完整响应仍已归档。" });
+                    return fitted;
+                } catch { /* 缩小运行时检查点，原始快照不变。 */ }
+            }
+            throw error;
+        }
     }
 
     /** 执行一次独立 Agent 尝试并保留真实生成结束原因 */
@@ -110,19 +127,23 @@ export class AgentRunner {
         images: ImageContent[] | undefined,
         history: AgentMessage[],
         summary: GenerationAttempt,
-        onCallCompleted: () => void,
+        execution: ExecutionRecord,
+        onCallCompleted: (settledSteps?: AgentExecutionStep[]) => void,
         overrideEffort?: ReasoningEffort
     ): Promise<{ messages: AgentMessage[]; modelReply: string; salvaged: SalvagedContent }> {
         const began = Date.now();
         const effort = overrideEffort ?? this.options.reasoningEffort ?? "high";
         let originalLength: GenerationCall | undefined;
         const starts = new Map<string, number>();
+        const toolSteps = new Map<string, AgentExecutionStep>();
+        const originalIndex = history.indexOf(this.originalUser);
+        const oldHistoryLength = originalIndex < 0 ? history.length : originalIndex;
         let agent: Agent;
         /** 在实际工具调用前记录可能发生的副作用 */
         const tools = this.tools.map(tool => ({
             ...tool,
             execute: async (...args: Parameters<typeof tool.execute>) => {
-                if (args[2]?.aborted || originalLength || this.persistenceError) {
+                if (args[2]?.aborted || this.options.signal?.aborted || originalLength || this.persistenceError) {
                     throw new Error("生成已终止，禁止执行工具");
                 }
                 if (!READ_TOOLS.has(tool.name)) {
@@ -132,6 +153,9 @@ export class AgentRunner {
                         call.sideEffectStarted = true;
                     }
                 }
+                execution.pendingToolCallIds.push(args[0]);
+                /** 执行工具前先保存待结算状态，写库失败时禁止产生副作用 */
+                onCallCompleted();
                 return tool.execute(...args);
             }
         }));
@@ -156,7 +180,7 @@ export class AgentRunner {
         };
         /** 包装单次模型流，显式传递预算、思考开关和取消信号 */
         const streamFn: StreamFn = (callModel, context, options) => {
-            if (options.signal?.aborted || originalLength || this.persistenceError) {
+            if (options.signal?.aborted || this.options.signal?.aborted || originalLength || this.persistenceError) {
                 throw new Error("生成已终止");
             }
             const stream = createAssistantMessageEventStream();
@@ -166,7 +190,10 @@ export class AgentRunner {
             options.signal?.addEventListener("abort", abort, { once: true });
             const callStart = Date.now();
             let lastTokenTime = callStart;
+            let partial: AssistantMessage | undefined;
+            let dirty = false;
             const call: GenerationCall = {
+                phase: "streaming",
                 callNo: summary.calls.length + 1,
                 maxTokens: summary.maxTokens,
                 status: "failed",
@@ -192,6 +219,7 @@ export class AgentRunner {
             }, 30000);
             /** 保存供应商返回的完整消息与本次调用统计 */
             const captureResponse = (message: AssistantMessage): void => {
+                call.phase = "finished";
                 call.response = structuredClone(message);
                 if (call.response.errorMessage) call.response.errorMessage = this.safeError(call.response.errorMessage);
                 call.stopReason = message.stopReason;
@@ -210,11 +238,30 @@ export class AgentRunner {
                 summary.stopReason = call.stopReason;
                 summary.error = call.error;
                 summary.durationMs = Date.now() - began;
+                if ((message.stopReason === "stop" || message.stopReason === "toolUse" || message.stopReason === "length") &&
+                    !execution.effectiveCallRefs.some(ref => ref.attemptNo === summary.attemptNo && ref.callNo === call.callNo)) {
+                    execution.effectiveCallRefs.push({ attemptNo: summary.attemptNo, callNo: call.callNo });
+                }
             };
+            /** 定期保存收到的流片段，不把 SDK 的临时 stop 标记当成完成 */
+            const checkpoint = setInterval(() => {
+                if (!dirty || !partial || call.phase !== "streaming" || this.persistenceError) return;
+                dirty = false;
+                call.response = structuredClone(partial);
+                call.durationMs = Date.now() - callStart;
+                call.thinkingChars = partial.content.reduce((sum, block) => sum + (block.type === "thinking" ? block.thinking.length : 0), 0);
+                call.hasText = Boolean(textOf(partial));
+                call.toolCallCount = partial.content.filter(block => block.type === "toolCall").length;
+                summary.durationMs = Date.now() - began;
+                try { onCallCompleted(); } catch { controller.abort(); }
+            }, 2000);
             void (async () => {
-                let partial: AssistantMessage | undefined;
                 try {
-                    const request = prepareModelRequest(context, callModel, effort, options.onPayload);
+                    onCallCompleted();
+                    if (summary.attemptNo === 1 && call.callNo === 1) this.originalUser = context.messages[oldHistoryLength];
+                    const requestContext = { ...context, messages: this.historyFor(context.messages.slice(0, oldHistoryLength),
+                        context.messages.slice(oldHistoryLength), summary.maxTokens) };
+                    const request = prepareModelRequest(requestContext, callModel, effort, options.onPayload);
                     const source = streamSimple(
                         callModel,
                         request.context, {
@@ -227,17 +274,28 @@ export class AgentRunner {
                     });
                     for await (const event of source) {
                         lastTokenTime = Date.now();
-                        if ("partial" in event) partial = event.partial;
+                        if ("partial" in event) { partial = event.partial; dirty = true; }
                         if (event.type === "done" || event.type === "error") {
                             const message = await source.result();
                             partial = message;
                             captureResponse(message);
                             /** 先持久化完整响应，再让 Agent 继续执行工具或下一次请求 */
                             onCallCompleted();
+                            if (event.type === "done") {
+                                const delivered = structuredClone(message);
+                                /** 截断调用只归档；给 Pi 完整临时副本使循环自然停止 */
+                                delivered.content = delivered.content.filter(block => block.type !== "toolCall" || message.stopReason !== "length");
+                                for (const block of delivered.content) {
+                                    if (block.type === "toolCall") block.id = historyToolId(summary.attemptNo, call.callNo, block.id);
+                                }
+                                stream.push({ ...event, message: delivered });
+                                continue;
+                            }
                         }
                         stream.push(event);
                     }
                 } catch (error) {
+                    call.phase = "finished";
                     call.status = timedOut ? "timeout" : controller.signal.aborted ? "aborted" : "failed";
                     call.stopReason = controller.signal.aborted ? "aborted" : "error";
                     call.error = this.persistenceError ?? this.safeError(error);
@@ -281,6 +339,7 @@ export class AgentRunner {
                     call.durationMs = Date.now() - callStart;
                     if (timeout) clearTimeout(timeout);
                     clearInterval(progress);
+                    clearInterval(checkpoint);
                     options.signal?.removeEventListener("abort", abort);
                     stream.end();
                 }
@@ -295,8 +354,8 @@ export class AgentRunner {
                     agent.abort();
                     return { block: true, reason: this.persistenceError };
                 }
+                if (this.options.signal?.aborted) return { block: true, reason: "任务已取消，禁止执行后续工具" };
                 if (originalLength || context.assistantMessage.stopReason === "length") {
-                    agent.abort();
                     return { block: true, reason: "工具调用来自被截断的生成，已阻止执行" };
                 }
                 const check = await permissionManager.checkToolPermission(context.toolCall.name, context.args as Record<string, any>, this.options.onAskPermission);
@@ -339,8 +398,6 @@ export class AgentRunner {
                 }
             } else if (event.type === "message_end" && event.message.role === "assistant") {
                 const assistantMsg = event.message as AssistantMessage;
-                if (assistantMsg.stopReason === "length") agent.abort();
-
                 // 若有未闭合的思考块，补发思考结束事件
                 if (thinkingStart > 0) {
                     this.emit({
@@ -365,25 +422,37 @@ export class AgentRunner {
                 }
             } else if (event.type === "tool_execution_start") {
                 starts.set(event.toolCallId, Date.now());
+                toolSteps.set(event.toolCallId, {
+                    type: "tool_call", attemptNo: summary.attemptNo, callNo: summary.calls.at(-1)?.callNo,
+                    turnNo: currentTurnNo, toolName: event.toolName, toolCallId: event.toolCallId,
+                    args: event.args, timestamp: Date.now()
+                });
                 this.emit({
                     type: "tool_call",
                     attemptNo: summary.attemptNo,
+                    callNo: summary.calls.at(-1)?.callNo,
                     turnNo: currentTurnNo,
                     toolName: event.toolName,
                     toolCallId: event.toolCallId,
                     args: event.args
                 });
             } else if (event.type === "tool_execution_end") {
-                this.emit({
+                const resultStep: AgentExecutionStep = {
                     type: "tool_result",
                     attemptNo: summary.attemptNo,
+                    callNo: summary.calls.at(-1)?.callNo,
                     turnNo: currentTurnNo,
                     toolName: event.toolName,
                     toolCallId: event.toolCallId,
                     result: event.result,
                     isError: event.isError,
-                    durationMs: Date.now() - (starts.get(event.toolCallId) ?? Date.now())
-                });
+                    durationMs: Date.now() - (starts.get(event.toolCallId) ?? Date.now()),
+                    timestamp: Date.now()
+                };
+                this.emit(resultStep);
+                execution.pendingToolCallIds = execution.pendingToolCallIds.filter(id => id !== event.toolCallId);
+                /** 工具结果先落库，再允许循环发起下一次请求 */
+                onCallCompleted([toolSteps.get(event.toolCallId)!, resultStep]);
                 starts.delete(event.toolCallId);
             } else if (event.type === "turn_end") {
                 this.emit({
@@ -394,14 +463,21 @@ export class AgentRunner {
                 currentTurnNo++;
             }
         });
+        /** 将外部取消信号传递到活动模型请求和工具循环 */
+        const abortRun = () => agent.abort();
+        this.options.signal?.addEventListener("abort", abortRun, { once: true });
         const startIndex = history.length;
-        try { await agent.prompt(prompt, images); }
+        try {
+            if (this.options.signal?.aborted) summary.status = "aborted";
+            else await agent.prompt(prompt, images);
+        }
         catch (error) { summary.error = this.safeError(error); }
+        finally { this.options.signal?.removeEventListener("abort", abortRun); }
         const messages = agent.state.messages.slice(startIndex);
         const lastAssistant = messages.filter((message): message is AssistantMessage => message.role === "assistant").at(-1);
         const lastCall = summary.calls.at(-1);
         const runtimeError = agent.state.errorMessage || lastAssistant?.errorMessage;
-        summary.status = this.persistenceError ? "failed" : originalLength ? "truncated" : lastCall?.status === "timeout" ? "timeout" :
+        summary.status = this.persistenceError ? "failed" : this.options.signal?.aborted ? "aborted" : originalLength ? "truncated" : lastCall?.status === "timeout" ? "timeout" :
             runtimeError && lastAssistant?.stopReason !== "aborted" ? "failed" : lastCall?.status ?? "failed";
         summary.stopReason = originalLength ? "length" : lastCall?.stopReason;
         summary.error = this.persistenceError ?? summary.error ?? (runtimeError ? this.safeError(runtimeError) : lastCall?.error);
@@ -416,295 +492,153 @@ export class AgentRunner {
         return { messages, modelReply, salvaged };
     }
 
-    /** 编排状态机恢复算法并返回可持久化的最终执行结果 */
+    /** 编排保留本轮进展的截断恢复并保存执行检查点 */
     public async run(prompt: string, images?: ImageContent[]): Promise<RunnerOutput> {
-        let latestSalvaged: SalvagedContent | undefined;
         const started = Date.now();
         this.steps.length = 0;
         this.persistenceError = undefined;
+        this.originalUser = {
+            role: "user", timestamp: started,
+            content: images?.length ? [{ type: "text", text: prompt }, ...images] : prompt
+        };
         const execution: ExecutionRecord = {
-            status: "failed", config: {
-                ...this.policy,
-                model: this.options.model,
+            phase: "running", status: "failed", effectiveCallRefs: [], pendingToolCallIds: [],
+            config: {
+                ...this.policy, model: this.options.model,
                 requestedReasoningEffort: this.options.reasoningEffort ?? "high",
                 contextWindow: this.contextWindow,
                 thinking: isMiMoModel(this.options.model) ? (this.options.reasoningEffort === "off" ? "disabled" : "enabled") : "sdk-default"
             },
-            attempts: [],
-            recoverySteps: [],
-            totalDurationMs: 0
+            attempts: [], recoverySteps: [], totalDurationMs: 0
         };
-        /** 将执行记录作为独立快照交给持久化层 */
-        const persistExecution = (): void => {
+        const settledSteps: AgentExecutionStep[] = [];
+        /** 保存执行快照与本次新增的已结算工具步骤 */
+        const persistExecution = (newSteps: AgentExecutionStep[] = []): void => {
+            settledSteps.push(...newSteps);
             execution.status = execution.attempts.at(-1)?.status ?? "failed";
             execution.totalDurationMs = Date.now() - started;
             try {
-                this.options.onExecution?.(structuredClone(execution));
+                this.options.onExecution?.(structuredClone(execution), structuredClone(newSteps));
             } catch (error) {
-                this.persistenceError = `执行记录持久化失败: ${this.safeError(error)}`;
+                this.persistenceError = "执行记录持久化失败: " + this.safeError(error);
                 throw new Error(this.persistenceError);
             }
         };
-
-        const maxRecoveryAttempts = 3;
-        const maxBudgetCeiling = isMiMoModel(this.options.model) ? 131072 : Math.max(65536, this.policy.retryMaxTokens);
-        let currentMaxTokens = this.policy.maxTokens;
+        /** 通过统一投影还原跨恢复尝试的有效本轮消息 */
+        const currentMessages = (): AgentMessage[] => restoreRecordedMessages({
+            turn: { executionJson: execution },
+            messages: settledSteps.filter(step => step.type === "tool_result").map(step => ({
+                role: "tool_result", createdAt: step.timestamp,
+                content: JSON.stringify({ id: step.toolCallId, tool: step.toolName, result: step.result, isError: step.isError })
+            }))
+        }) ?? [];
+        const maxRecoveryAttempts = 2;
+        const maxTokens = Math.min(this.policy.maxTokens, this.policy.retryMaxTokens);
         let activePrompt = prompt;
-        let activeImages = images;
-        let activeReasoningEffort = this.options.reasoningEffort ?? "high";
-        const accumulatedChunks: string[] = [];
+        let effort = this.options.reasoningEffort ?? "high";
+        let latestSalvaged: SalvagedContent;
         let messages: AgentMessage[] = [];
-        let modelReply = "";
         let contextError = "";
-        let isDone = false;
+        let continuation = false;
+        let chunks: string[] = [];
 
-        /** 状态机主循环：驱动单次执行并在截断时依阶段分支自愈 */
-        while (!isDone) {
-            let history: AgentMessage[];
-            try {
-                history = this.historyFor(activePrompt, activeImages, currentMaxTokens);
-            } catch (error) {
-                contextError = this.safeError(error);
-                break;
-            }
-
+        while (true) {
             const summary: GenerationAttempt = {
-                attemptNo: execution.attempts.length + 1,
-                maxTokens: currentMaxTokens,
-                status: "failed",
-                durationMs: 0,
-                sideEffectStarted: false,
-                calls: []
+                attemptNo: execution.attempts.length + 1, maxTokens,
+                status: "failed", durationMs: 0, sideEffectStarted: false, calls: []
             };
             execution.attempts.push(summary);
-
-            // 执行模型单次尝试（对应流程图：Pi SDK 返回）
-            const attemptResult = await this.attempt(activePrompt, activeImages, history, summary, persistExecution, activeReasoningEffort);
-            messages = attemptResult.messages;
-            latestSalvaged = attemptResult.salvaged;
-
-            if (this.persistenceError) {
-                contextError = this.persistenceError;
-                break;
-            }
-            /** 保存工具副作用与最终尝试状态，确保重试前记录已完整落库 */
+            execution.phase = "running";
             try { persistExecution(); }
-            catch { contextError = this.persistenceError!; break; }
+            catch { contextError = this.persistenceError; break; }
+            const history = summary.attemptNo === 1 ? this.options.initialMessages ?? [] :
+                [...this.options.initialMessages ?? [], this.originalUser, ...currentMessages()];
+            const result = await this.attempt(activePrompt, summary.attemptNo === 1 ? images : undefined,
+                history, summary, execution, persistExecution, effort);
+            messages = result.messages;
+            latestSalvaged = result.salvaged;
+            if (latestSalvaged.text) {
+                if (continuation) chunks.push(latestSalvaged.text);
+                else chunks = [latestSalvaged.text];
+            }
+            if (this.persistenceError) { contextError = this.persistenceError; break; }
+            try { persistExecution(); }
+            catch { contextError = this.persistenceError; break; }
 
-            // 判断本轮是否发生截断
-            const isTruncated = summary.status === "truncated" || summary.stopReason === "length";
-            if (!isTruncated) {
-                // 本轮成功：回到正常 Agent Loop
-                if (accumulatedChunks.length > 0) {
-                    if (latestSalvaged.text) accumulatedChunks.push(latestSalvaged.text);
-                    modelReply = aggregateTextChunks(accumulatedChunks);
-                } else {
-                    modelReply = latestSalvaged.text;
-                }
-                if (execution.recoverySteps && execution.recoverySteps.length > 0) {
-                    execution.recoverySteps[execution.recoverySteps.length - 1].success = true;
-                }
-                isDone = true;
+            const previousRecovery = execution.recoverySteps.at(-1);
+            if (previousRecovery) previousRecovery.success = summary.status === "completed";
+            if (summary.status !== "truncated") {
+                if (execution.pendingToolCallIds.length) contextError = "存在执行结果未知的工具操作，已停止自动恢复。";
                 break;
             }
-
-            // 截断发生在此什么阶段？
-            const stage = detectTruncationStage(messages, summary);
-            summary.recoveryStage = stage;
-
-            // 若本轮已经执行了写工具等外部变更，禁止重跑以防重复副作用
-            if (summary.sideEffectStarted) {
+            summary.recoveryStage = detectTruncationStage(messages, summary);
+            if (this.options.signal?.aborted || execution.pendingToolCallIds.length) {
+                contextError = execution.pendingToolCallIds.length ? "存在执行结果未知的工具操作，已停止自动恢复。" : "";
                 break;
             }
+            const recoveryCount = execution.recoverySteps.length;
+            if (recoveryCount >= maxRecoveryAttempts) break;
 
-            // 检查是否达到最大恢复次数
-            const recoveryCount = execution.recoverySteps?.length ?? 0;
-            if (recoveryCount >= maxRecoveryAttempts) {
-                break;
-            }
-
-            // 分阶段恢复算法分支
-            if (stage === "thinking") {
-                // Thinking 阶段截断
-                const canReuse = canReuseReasoningState(this.options.model);
-                if (canReuse) {
-                    // 保留合法的推理状态发起续接请求
-                    execution.recoverySteps?.push({
-                        recoveryAttemptNo: recoveryCount + 1,
-                        stage: "thinking",
-                        actionTaken: "reuse_reasoning",
-                        previousTokens: currentMaxTokens,
-                        newTokens: currentMaxTokens,
-                        accumulatedTextLength: 0,
-                        success: false
-                    });
-                } else {
-                    const escalation = escalateBudget(currentMaxTokens, maxBudgetCeiling);
-                    if (escalation.canEscalate) {
-                        // 可提高输出预算？-> 是：提高 maxTokens 重新调用原始请求
-                        const prev = currentMaxTokens;
-                        currentMaxTokens = escalation.nextTokens;
-                        this.emit({
-                            type: "status",
-                            attemptNo: summary.attemptNo,
-                            content: `Thinking 阶段预算耗尽，提高输出预算：${prev} → ${currentMaxTokens} token，重新发起原始请求`
-                        });
-                        execution.recoverySteps?.push({
-                            recoveryAttemptNo: recoveryCount + 1,
-                            stage: "thinking",
-                            actionTaken: "boost_budget_original",
-                            previousTokens: prev,
-                            newTokens: currentMaxTokens,
-                            accumulatedTextLength: 0,
-                            success: false
-                        });
-                    } else {
-                        // 可提高输出预算？-> 否：保留可见进展 生成任务检查点并继续
-                        const lastAssistant = messages.filter((m): m is AssistantMessage => m.role === "assistant").at(-1);
-                        const checkpoint = generateThinkingCheckpoint(thinkingOf(lastAssistant));
-                        this.emit({
-                            type: "status",
-                            attemptNo: summary.attemptNo,
-                            content: `Thinking 阶段预算已达上限，已提取思考检查点，关闭冗余思考直接生成正文`
-                        });
-                        activePrompt = buildCheckpointPrompt(prompt, checkpoint);
-                        activeReasoningEffort = "off";
-                        execution.recoverySteps?.push({
-                            recoveryAttemptNo: recoveryCount + 1,
-                            stage: "thinking",
-                            actionTaken: "checkpoint_continue",
-                            previousTokens: currentMaxTokens,
-                            newTokens: currentMaxTokens,
-                            accumulatedTextLength: 0,
-                            success: false,
-                            note: checkpoint
-                        });
-                    }
-                }
-            } else if (stage === "text") {
-                // 普通正文阶段截断
-                // 1. 保存完整可见文本片段
-                if (latestSalvaged.text) {
-                    accumulatedChunks.push(latestSalvaged.text);
-                }
-                const currentAggregated = aggregateTextChunks(accumulatedChunks);
-                // 2. 根据历史文本发起续写
-                this.emit({
-                    type: "status",
-                    attemptNo: summary.attemptNo,
-                    content: `正文生成达单次上限（已打捞 ${currentAggregated.length} 字符），正在无缝发起续写 (${recoveryCount + 1}/${maxRecoveryAttempts})...`
-                });
-                activePrompt = buildContinuationPrompt(currentAggregated);
-                const escalation = escalateBudget(currentMaxTokens, maxBudgetCeiling);
-                const prev = currentMaxTokens;
-                if (escalation.canEscalate) {
-                    currentMaxTokens = escalation.nextTokens;
-                }
-                execution.recoverySteps?.push({
-                    recoveryAttemptNo: recoveryCount + 1,
-                    stage: "text",
-                    actionTaken: "text_continuation",
-                    previousTokens: prev,
-                    newTokens: currentMaxTokens,
-                    accumulatedTextLength: currentAggregated.length,
-                    success: false
-                });
-                // 3. 分段呈现与聚合在循环结束或下轮由 aggregateTextChunks 统一缝合
-            } else if (stage === "tool_call") {
-                // ToolCall 参数阶段截断
-                // 1. 禁止执行不完整工具调用
-                messages = sanitizeIncompleteToolCalls(messages);
-                // 2. 提高预算并重试该模型步骤
-                const escalation = escalateBudget(currentMaxTokens, maxBudgetCeiling);
-                const prev = currentMaxTokens;
-                if (escalation.canEscalate) {
-                    currentMaxTokens = escalation.nextTokens;
-                }
-                this.emit({
-                    type: "status",
-                    attemptNo: summary.attemptNo,
-                    content: `ToolCall 参数截断，已拦截未完成工具调用；提升输出预算至 ${currentMaxTokens} token 重试本步骤`
-                });
-                execution.recoverySteps?.push({
-                    recoveryAttemptNo: recoveryCount + 1,
-                    stage: "tool_call",
-                    actionTaken: "retry_tool_call",
-                    previousTokens: prev,
-                    newTokens: currentMaxTokens,
-                    accumulatedTextLength: 0,
-                    success: false
-                });
-            }
+            const stage = summary.recoveryStage;
+            continuation = stage === "text";
+            effort = "off";
+            activePrompt = buildRecoveryPrompt(stage);
+            const action = stage === "thinking" ? "checkpoint_continue" : stage === "text" ? "text_continuation" : "retry_tool_call";
+            summary.recoveryAction = action;
+            execution.recoverySteps.push({
+                recoveryAttemptNo: recoveryCount + 1, stage, actionTaken: action,
+                previousTokens: maxTokens, newTokens: maxTokens,
+                accumulatedTextLength: aggregateTextChunks(chunks).length,
+                success: false, note: activePrompt
+            });
+            execution.phase = "recovering";
+            /** 决策先落库，再进入下一次请求 */
+            try { persistExecution(); }
+            catch { contextError = this.persistenceError; break; }
+            const stageName = stage === "tool_call" ? "工具参数" : stage === "text" ? "正文" : "思考";
+            this.emit({
+                type: "status", attemptNo: summary.attemptNo,
+                content: stageName + "达到单次输出上限，保留本轮进展并请求关闭思考继续（" +
+                    (recoveryCount + 1) + "/" + maxRecoveryAttempts + "，预算 " + maxTokens + " token）。"
+            });
         }
 
         const last = execution.attempts.at(-1);
-        execution.status = last?.status ?? "failed";
-        if (contextError || last?.error) {
-            execution.error = contextError || last?.error;
+        execution.phase = "finished";
+        if (contextError) {
+            execution.error = contextError;
+            if (this.persistenceError || last?.status !== "truncated") {
+                if (last) last.status = "failed";
+            }
+        }
+        if (this.options.signal?.aborted && !this.persistenceError && last) last.status = "aborted";
+        if (last?.error && !execution.error) execution.error = last.error;
+        if (!this.persistenceError) {
+            try { persistExecution(); } catch { /* 下方统一返回持久化失败。 */ }
         }
         execution.totalDurationMs = Date.now() - started;
-        if (!this.persistenceError) {
-            try { persistExecution(); } catch { /* 下方统一报告持久化失败。 */ }
-        }
-        if (this.persistenceError) {
-            execution.status = "failed";
-            execution.error = this.persistenceError;
-        }
-
-        // 如果在正文阶段累积了分段续写片段，聚合并更新 modelReply
-        if (accumulatedChunks.length > 0) {
-            if (latestSalvaged?.text && !accumulatedChunks.includes(latestSalvaged.text)) {
-                accumulatedChunks.push(latestSalvaged.text);
-            }
-            modelReply = aggregateTextChunks(accumulatedChunks);
-        } else {
-            modelReply = latestSalvaged?.text ?? "";
-        }
-
-        const finalSalvaged: SalvagedContent = latestSalvaged ?? salvageResponse(messages, last!);
+        execution.status = this.persistenceError ? "failed" : last?.status ?? "failed";
+        if (this.persistenceError) execution.error = this.persistenceError;
+        const modelReply = aggregateTextChunks(chunks);
+        const finalSalvaged = latestSalvaged ?? salvageResponse(messages, last);
         if (modelReply) {
             finalSalvaged.text = modelReply;
             finalSalvaged.hasUsableContent = true;
+            if (execution.status !== "completed") finalSalvaged.quality = "partial_text";
         }
-
-        // 合成最终呈现回复：完成则直接展示正文，达到恢复上限仍截断则输出未完成报告
-        let reply: string;
-        if (this.persistenceError) {
-            reply = `${modelReply ? modelReply + "\n\n" : ""}⚠️ ${this.persistenceError}，已停止后续请求与工具执行。`;
-        } else if (execution.status === "completed") {
-            reply = modelReply;
-        } else if (execution.status === "truncated") {
-            const recoveryCount = execution.recoverySteps?.length ?? 0;
-            if (recoveryCount > 0) {
-                reply = composeIncompleteReport(finalSalvaged, last, recoveryCount, last?.recoveryStage);
-            } else {
-                reply = composeReply(finalSalvaged, execution.status, last, contextError, this.policy.generationTimeoutMs);
-            }
-        } else {
-            reply = composeReply(finalSalvaged, execution.status, last, contextError, this.policy.generationTimeoutMs);
-        }
-
-        const validCalls = new Set(messages.filter((message): message is AssistantMessage => message.role === "assistant" &&
-            (message.stopReason === "stop" || message.stopReason === "toolUse"))
-            .flatMap(message => message.content.filter(block => block.type === "toolCall")
-                .map(block => block.id)));
-        const pairedCalls = new Set(messages.filter(message => message.role === "toolResult" && validCalls.has(message.toolCallId)).map(message => (message as any).toolCallId));
-        const contextSteps = this.steps.filter(step => step.attemptNo === last?.attemptNo &&
-            (step.type === "tool_call" || step.type === "tool_result") && pairedCalls.has(step.toolCallId));
-
+        const reply = this.persistenceError
+            ? (modelReply ? modelReply + "\n\n" : "") + "⚠️ " + this.persistenceError + "，已停止后续请求与工具执行。"
+            : execution.status === "completed" ? modelReply
+            : execution.status === "truncated" && execution.recoverySteps.length
+                ? composeIncompleteReport(finalSalvaged, last, execution.recoverySteps.length, last?.recoveryStage) +
+                    (contextError ? "\n" + contextError : "")
+                : composeReply(finalSalvaged, execution.status, last, execution.error, this.policy.generationTimeoutMs);
         return {
-            reply,
-            modelReply,
-            steps: [...this.steps],
-            contextSteps,
-            newMessages: messages,
-            totalDurationMs: execution.totalDurationMs,
-            status: execution.status,
-            stopReason: last?.stopReason,
-            isTruncated: execution.status === "truncated",
-            execution,
-            responseQuality: finalSalvaged.quality,
-            salvaged: finalSalvaged
+            reply, modelReply, steps: [...this.steps], contextSteps: settledSteps,
+            newMessages: [this.originalUser, ...currentMessages()],
+            totalDurationMs: execution.totalDurationMs, status: execution.status, stopReason: last?.stopReason,
+            isTruncated: execution.status === "truncated", execution,
+            responseQuality: finalSalvaged.quality, salvaged: finalSalvaged
         };
     }
 }

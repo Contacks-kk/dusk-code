@@ -4,6 +4,10 @@ import { agentService } from "../services/agent.service";
 export class AgentController {
     /** 处理用户对话请求并运行 Agent Loop 交互接口 */
     public async chat(req: Request, res: Response): Promise<void> {
+        const controller = new AbortController();
+        /** 客户端提前断开时取消模型并保存已收到的片段 */
+        const disconnected = () => { if (!res.writableEnded) controller.abort(); };
+        res.on("close", disconnected);
         try {
             const userInput = req.body.message ?? req.body.input;
             if (!userInput || typeof userInput !== "string") {
@@ -12,16 +16,22 @@ export class AgentController {
             }
 
             const sessionId = req.body.sessionId !== undefined ? Number(req.body.sessionId) : undefined;
-            const result = await agentService.chat(sessionId, userInput);
+            const result = await agentService.chat(sessionId, userInput, { signal: controller.signal });
 
-            res.json({ data: result });
+            if (!res.destroyed) res.json({ data: result });
         } catch (error: any) {
-            res.status(500).json({ error: error.message || "Agent 执行异常" });
+            if (!res.destroyed) res.status(500).json({ error: error.message || "Agent 执行异常" });
+        } finally {
+            res.off("close", disconnected);
         }
     }
 
     /** 处理用户对话请求并以 SSE 流式输出 Agent 执行链路步骤与最终答复 */
     public async chatStream(req: Request, res: Response): Promise<void> {
+        const controller = new AbortController();
+        /** SSE 连接提前断开时取消活动任务 */
+        const disconnected = () => { if (!res.writableEnded) controller.abort(); };
+        res.on("close", disconnected);
         try {
             const userInput = req.body?.message ?? req.body?.input ?? req.query?.message;
             if (!userInput || typeof userInput !== "string") {
@@ -39,20 +49,26 @@ export class AgentController {
             res.flushHeaders?.();
 
             // 驱动 Agent Loop 并将每一步生命周期事件实时写入 SSE 流
-            const result = await agentService.chat(sessionId, userInput, (step) => {
-                res.write(`data: ${JSON.stringify({ type: "step", step })}\n\n`);
+            const result = await agentService.chat(sessionId, userInput, {
+                signal: controller.signal,
+                onStep: step => { if (!res.destroyed) res.write(`data: ${JSON.stringify({ type: "step", step })}\n\n`); }
             });
 
             // 推送最终完成信号与整体载荷
-            res.write(`data: ${JSON.stringify({ type: "done", data: result })}\n\n`);
-            res.end();
+            if (!res.destroyed) {
+                res.write(`data: ${JSON.stringify({ type: "done", data: result })}\n\n`);
+                res.end();
+            }
         } catch (error: any) {
+            if (res.destroyed) return;
             if (!res.headersSent) {
                 res.status(500).json({ error: error.message || "Agent 执行异常" });
             } else {
                 res.write(`data: ${JSON.stringify({ type: "error", error: error.message })}\n\n`);
                 res.end();
             }
+        } finally {
+            res.off("close", disconnected);
         }
     }
 }

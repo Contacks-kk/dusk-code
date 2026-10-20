@@ -3,29 +3,35 @@ import { colors, formatDuration } from "./theme";
 import { turnHistoryManager, type TurnRecord, type ToolCallDetail } from "./turn-history";
 import { interactiveSelect, type SelectItem } from "./interactive-prompt";
 import { renderMarkdown } from "./markdown";
+import { mouseTracker } from "./mouse-tracker";
 
 export class TurnInspector {
     /** 等待用户按任意键继续 */
     private async waitForKey(promptText = "按任意键折叠收起..."): Promise<void> {
         if (!process.stdin.isTTY) return;
         return new Promise<void>((resolve) => {
-            readline.emitKeypressEvents(process.stdin);
+            const input = mouseTracker.isActive() ? mouseTracker.input : process.stdin;
+            readline.emitKeypressEvents(input);
             process.stdin.setRawMode(true);
             process.stdout.write(`\n${colors.gray}${promptText}${colors.reset}\n`);
 
+            /** 清理详情输入监听并按需还原终端模式 */
             const cleanup = () => {
-                process.stdin.off("keypress", onKeypress);
-                process.stdin.off("data", onData);
-                if (process.stdin.isTTY) {
+                input.off("keypress", onKeypress);
+                input.off("data", onData);
+                if (process.stdin.isTTY && !mouseTracker.isActive()) {
                     process.stdin.setRawMode(false);
                 }
             };
 
-            const onKeypress = () => {
+            /** 按键确认后返回上一层详情 */
+            const onKeypress = (_text: string, key: readline.Key) => {
                 cleanup();
                 resolve();
+                if (key?.ctrl && key.name === "c") process.emit("SIGINT");
             };
 
+            /** 接收终端文本输入并返回详情 */
             const onData = (chunk: Buffer) => {
                 const str = chunk.toString("utf-8");
                 if (str.length > 0) {
@@ -34,36 +40,36 @@ export class TurnInspector {
                 }
             };
 
-            process.stdin.on("keypress", onKeypress);
-            process.stdin.on("data", onData);
+            input.on("keypress", onKeypress);
+            input.on("data", onData);
         });
     }
 
-    /** 直接就地切换指定轮次的展开与折叠视图 */
+    /** 切换指定执行记录的思考展开状态 */
     public async toggleTurnExpansion(turnNo: number): Promise<void> {
         const turn = turnHistoryManager.getTurn(turnNo);
         if (!turn) {
-            console.log(`\n${colors.yellow}未找到 Turn #${turnNo} 的执行记录。${colors.reset}\n`);
+            console.log(`\n${colors.yellow}未找到对应的执行记录。${colors.reset}\n`);
             return;
         }
 
         const isNowExpanded = turnHistoryManager.toggleExpanded(turnNo);
         if (!isNowExpanded) {
-            console.log(`\n${colors.gray}▸ Turn ${turnNo} 思考过程已折叠收起${colors.reset}\n`);
+            console.log(`\n${colors.gray}▸ 思考过程已折叠收起${colors.reset}\n`);
             return;
         }
 
-        console.log(`\n${colors.cyan}╭──────────────────────── Turn ${turn.turnNo} 思考详情 (${formatDuration(turn.thinkingDurationMs)}) ────────────────────────╮${colors.reset}`);
+        console.log(`\n${colors.cyan}╭──────────────────────── 思考详情 (${formatDuration(turn.thinkingDurationMs)}) ────────────────────────╮${colors.reset}`);
         if (turn.thinkingText) {
             console.log(turn.thinkingText);
         } else {
-            console.log(`${colors.gray}(本轮未产生思考记录)${colors.reset}`);
+            console.log(`${colors.gray}(此记录没有思考内容)${colors.reset}`);
         }
         console.log(`${colors.cyan}╰────────────────────────────────────────────────────────────────────────╯${colors.reset}`);
 
         await this.waitForKey("▶ 按任意键折叠收起思考详情...");
         turnHistoryManager.toggleExpanded(turnNo);
-        console.log(`${colors.gray}▸ Turn ${turnNo} 思考过程已折叠收起${colors.reset}\n`);
+        console.log(`${colors.gray}▸ 思考过程已折叠收起${colors.reset}\n`);
     }
 
     /** 展开展示某工具的完整参数与返回响应 */
@@ -96,10 +102,10 @@ ${colors.cyan}──────────────────────
         await this.waitForKey("按任意键返回工具列表...");
     }
 
-    /** Level 3: 展开该轮次的工具调用与响应集合 */
+    /** 展开执行记录中的工具调用与响应 */
     private async inspectToolCalls(turn: TurnRecord): Promise<void> {
         if (turn.toolCalls.length === 0) {
-            console.log(`\n${colors.yellow}Turn ${turn.turnNo} 本轮未发生任何工具调用。${colors.reset}\n`);
+            console.log(`\n${colors.yellow}此执行记录没有工具调用。${colors.reset}\n`);
             await this.waitForKey();
             return;
         }
@@ -111,7 +117,7 @@ ${colors.cyan}──────────────────────
                 return {
                     label: `● ${tc.name}`,
                     value: idx,
-                    hint: `${status} ${time} · 点击展开完整响应`
+                    hint: `${status} ${time} · Enter 查看完整响应`
                 };
             });
 
@@ -122,7 +128,7 @@ ${colors.cyan}──────────────────────
 
             const chosen = await interactiveSelect(
                 items,
-                `Turn ${turn.turnNo} 工具响应集合 (共 ${turn.toolCalls.length} 项)`
+                `工具响应集合 (共 ${turn.toolCalls.length} 项)`
             );
 
             if (chosen === null || chosen === -1) {
@@ -136,7 +142,7 @@ ${colors.cyan}──────────────────────
         }
     }
 
-    /** Level 2: 展开指定 Turn 的核心要素集合（思考、说明、工具集合） */
+    /** 展开执行记录的思考、说明和工具详情 */
     public async inspectTurn(turn: TurnRecord): Promise<void> {
         while (true) {
             const items: SelectItem<string>[] = [
@@ -162,13 +168,13 @@ ${colors.cyan}──────────────────────
             });
 
             items.push({
-                label: "↩ 返回轮次列表",
+                label: "↩ 返回执行记录列表",
                 value: "back"
             });
 
             const choice = await interactiveSelect(
                 items,
-                `Turn ${turn.turnNo} 详情检查器`
+                "执行详情"
             );
 
             if (choice === null || choice === "back") {
@@ -177,13 +183,13 @@ ${colors.cyan}──────────────────────
 
             if (choice === "thinking") {
                 console.log(`
-${colors.cyan}╭──────────────────────── Turn ${turn.turnNo} 完整思考链路 ────────────────────────╮${colors.reset}
-${colors.gray}${turn.thinkingText || "(本轮未产生思考记录)"}${colors.reset}
+${colors.cyan}╭──────────────────────── 完整思考过程 ────────────────────────╮${colors.reset}
+${colors.gray}${turn.thinkingText || "(此记录没有思考内容)"}${colors.reset}
 ${colors.cyan}╰────────────────────────────────────────────────────────────────────────╯${colors.reset}`);
                 await this.waitForKey("按任意键收起思考过程...");
             } else if (choice === "intermediate") {
                 console.log(`
-${colors.magenta}╭──────────────────────── Turn ${turn.turnNo} 中间发言说明 ────────────────────────╮${colors.reset}
+${colors.magenta}╭──────────────────────── 中间发言说明 ────────────────────────╮${colors.reset}
 ${renderMarkdown(turn.intermediateText || "")}
 ${colors.magenta}╰────────────────────────────────────────────────────────────────────────╯${colors.reset}`);
                 await this.waitForKey("按任意键收起发言说明...");
@@ -193,11 +199,11 @@ ${colors.magenta}╰────────────────────
         }
     }
 
-    /** Level 1: 打开交互式 Turn 检查器 */
+    /** 打开思考与工具执行记录检查器 */
     public async open(targetTurnNo?: number): Promise<void> {
         const turns = turnHistoryManager.getTurns();
         if (turns.length === 0) {
-            console.log(`\n${colors.yellow}当前会话暂无执行轮次记录。${colors.reset}\n`);
+            console.log(`\n${colors.yellow}当前会话暂无执行记录。${colors.reset}\n`);
             return;
         }
 
@@ -207,7 +213,7 @@ ${colors.magenta}╰────────────────────
                 await this.inspectTurn(matched);
                 return;
             }
-            console.log(`\n${colors.yellow}未找到 Turn #${targetTurnNo} 的执行记录。${colors.reset}\n`);
+            console.log(`\n${colors.yellow}未找到对应的执行记录。${colors.reset}\n`);
         }
 
         // 若仅有 1 轮，直接进入该轮
@@ -218,7 +224,7 @@ ${colors.magenta}╰────────────────────
 
         while (true) {
             const items: SelectItem<number>[] = turns.map((t) => ({
-                label: `Turn ${t.turnNo}`,
+                label: t.toolCalls.slice(0, 2).map(tool => tool.name).join(" · ") || (t.intermediateText ? "助手回复" : "模型思考"),
                 value: t.turnNo,
                 hint: `思考 ${formatDuration(t.thinkingDurationMs)} · ${t.toolCalls.length} 个工具调用`
             }));
@@ -230,7 +236,7 @@ ${colors.magenta}╰────────────────────
 
             const selectedTurnNo = await interactiveSelect(
                 items,
-                "选择要展开查看的 Loop Turn 轮次"
+                "选择要查看的执行记录"
             );
 
             if (selectedTurnNo === null || selectedTurnNo === -1) {

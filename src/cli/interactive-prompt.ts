@@ -4,6 +4,7 @@ import { colors } from "./theme";
 import { reasoningLabel } from "../agent/runtime/generation-policy";
 import { turnHistoryManager } from "./turn-history";
 import { turnInspector } from "./turn-inspector";
+import { mouseTracker } from "./mouse-tracker";
 
 export interface CommandOption {
     name: string;
@@ -19,7 +20,7 @@ export const SLASH_COMMANDS: CommandOption[] = [
     { name: "/compact", description: "上下文压缩：显式压缩历史大报文并释放 Token" },
     { name: "/resume", description: "会话恢复：上下键选择当前工程历史会话" },
     { name: "/new", description: "新建会话：开启当前工程下的全新独立会话" },
-    { name: "/turn", description: "链路检查：交互式展开任意轮次的思考全文、工具集合与响应结果" },
+    { name: "/turn", description: "链路检查：查看思考全文、工具调用与响应结果" },
     { name: "/help", description: "帮助指南：显示支持的指令与快捷说明" },
     { name: "exit", description: "退出终端程序" }
 ];
@@ -51,7 +52,8 @@ export async function interactiveSelect<T>(
         return items[0].value;
     }
 
-    readline.emitKeypressEvents(process.stdin);
+    const input = mouseTracker.isActive() ? mouseTracker.input : process.stdin;
+    readline.emitKeypressEvents(input);
     process.stdin.setRawMode(true);
     process.stdout.write("\x1b[?25l"); // 隐藏光标
 
@@ -85,8 +87,8 @@ export async function interactiveSelect<T>(
 
         /** 清理输入监听与恢复光标 */
         const cleanup = () => {
-            process.stdin.off("keypress", onKeypress);
-            if (process.stdin.isTTY) {
+            input.off("keypress", onKeypress);
+            if (process.stdin.isTTY && !mouseTracker.isActive()) {
                 process.stdin.setRawMode(false);
             }
             process.stdout.write("\x1b[?25h"); // 恢复光标
@@ -105,7 +107,9 @@ export async function interactiveSelect<T>(
             if (key.ctrl && key.name === "c") {
                 cleanup();
                 process.stdout.write("\n");
-                process.exit(0);
+                process.emit("SIGINT");
+                resolve(null);
+                return;
             }
 
             // Esc 取消选择
@@ -140,11 +144,11 @@ export async function interactiveSelect<T>(
             }
         };
 
-        process.stdin.on("keypress", onKeypress);
+        input.on("keypress", onKeypress);
     });
 }
 
-/** 终端 Codex CLI 风格交互式输入区，支持暗底输入栏、状态行与 Ctrl+O 展开折叠 */
+/** 渲染终端输入区、状态行并响应思考详情快捷键 */
 export async function interactivePrompt(
     contextOrPrefix: PromptContext | string,
     commands: CommandOption[] = SLASH_COMMANDS
@@ -169,7 +173,8 @@ export async function interactivePrompt(
         });
     }
 
-    readline.emitKeypressEvents(process.stdin);
+    const input = mouseTracker.isActive() ? mouseTracker.input : process.stdin;
+    readline.emitKeypressEvents(input);
     process.stdin.setRawMode(true);
 
     let buffer = "";
@@ -177,7 +182,6 @@ export async function interactivePrompt(
     let selectedMatchIndex = 0;
     let isFirstRender = true;
     let linesAbove = 1; // 记录当前光标距离整个输入组件顶部的垂直行数
-    let hasTurnsToolbar = false;
 
     const placeholderText = context.placeholder || "How can I help you?";
     const bg = "\x1b[48;5;236m"; // Codex 暗灰输入框通体背景
@@ -206,14 +210,18 @@ export async function interactivePrompt(
     };
 
     return new Promise<string>((resolve) => {
-        /** 响应 Ctrl+O 快捷键，就地展开或收起最新轮次思考详情 */
+        /** 响应 Ctrl+O 快捷键，展开最近一次思考详情 */
         const toggleLatestTurn = async () => {
+            if (mouseTracker.isActive()) {
+                mouseTracker.openLatestThought();
+                return;
+            }
             const turnsList = turnHistoryManager.getTurns();
             if (turnsList.length === 0) return;
             const latestTurn = turnsList[turnsList.length - 1];
 
             // 临时解绑当前输入监听，防止用户确认收起时的按键回落进输入框
-            process.stdin.off("keypress", onKeypress);
+            input.off("keypress", onKeypress);
             process.stdout.write(`\x1b[${linesAbove}A\r\x1b[0J`);
 
             await turnInspector.toggleTurnExpansion(latestTurn.turnNo);
@@ -222,12 +230,12 @@ export async function interactivePrompt(
             if (process.stdin.isTTY) {
                 process.stdin.setRawMode(true);
             }
-            process.stdin.on("keypress", onKeypress);
+            input.on("keypress", onKeypress);
             isFirstRender = true;
             render();
         };
 
-        /** 渲染 Codex CLI 风格三行 Padding 输入框、状态行及上方轮次展开栏 */
+        /** 渲染输入框、模型状态和命令候选项 */
         const render = () => {
             process.stdout.write("\x1b[?25l"); // 隐藏光标防闪烁
 
@@ -236,21 +244,6 @@ export async function interactivePrompt(
                 process.stdout.write(`\x1b[${linesAbove}A\r\x1b[0J`);
             } else {
                 isFirstRender = false;
-            }
-
-            // 0. Line 0: 快捷轮次状态条
-            const turns = turnHistoryManager.getTurns();
-            hasTurnsToolbar = turns.length > 0;
-            if (hasTurnsToolbar) {
-                process.stdout.write(`  ${colors.gray}✦ 轮次:${colors.reset} `);
-                for (const t of turns) {
-                    const isExp = t.isExpanded;
-                    const icon = isExp ? "▼" : "▶";
-                    const label = `[Turn ${t.turnNo} ${icon}]`;
-                    const color = isExp ? colors.cyan : colors.white;
-                    process.stdout.write(`${color}${colors.bold}${label}${colors.reset} `);
-                }
-                process.stdout.write(`${colors.gray}${colors.dim}(Ctrl+O 展开 · /turn 详情)${colors.reset}\x1b[K\n`);
             }
 
             // 1. Line 1: 上 padding 行（纯背景色整行铺满）
@@ -313,15 +306,15 @@ export async function interactivePrompt(
             }
 
             // 记录当前光标距离组件顶部的行数，用于下次渲染回退清屏
-            linesAbove = (hasTurnsToolbar ? 2 : 1) + cursorRow;
+            linesAbove = 1 + cursorRow;
 
             process.stdout.write("\x1b[?25h"); // 恢复光标可见
         };
 
         /** 清理输入监听与恢复光标 */
         const cleanup = () => {
-            process.stdin.off("keypress", onKeypress);
-            if (process.stdin.isTTY) {
+            input.off("keypress", onKeypress);
+            if (process.stdin.isTTY && !mouseTracker.isActive()) {
                 process.stdin.setRawMode(false);
             }
             process.stdout.write("\x1b[?25h");
@@ -331,7 +324,7 @@ export async function interactivePrompt(
         const onKeypress = async (str: string, key: readline.Key) => {
             if (!key) return;
 
-            // Ctrl+O: 快捷就地展开或收起最新轮次思考详情
+            /** Ctrl+O 打开最近一次完整思考 */
             if (key.ctrl && key.name === "o") {
                 await toggleLatestTurn();
                 return;
@@ -351,7 +344,9 @@ export async function interactivePrompt(
             if (key.ctrl && key.name === "c") {
                 cleanup();
                 process.stdout.write(`\x1b[${linesAbove}A\r\x1b[0J\n`);
-                process.exit(0);
+                process.emit("SIGINT");
+                resolve("");
+                return;
             }
 
             const matches = getMatches();
@@ -456,6 +451,6 @@ export async function interactivePrompt(
         };
 
         render();
-        process.stdin.on("keypress", onKeypress);
+        input.on("keypress", onKeypress);
     });
 }

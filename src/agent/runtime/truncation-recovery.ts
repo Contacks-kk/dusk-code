@@ -2,166 +2,64 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { GenerationAttempt, TruncationStage } from "../types";
 
-/** 提取助手消息中的全部正文文本 */
-function textOf(message?: AssistantMessage): string {
-    if (!message) return "";
-    return message.content
-        .filter(block => block.type === "text")
-        .map(block => block.text)
-        .join("\n")
-        .trim();
-}
-
 /** 提取助手消息中的完整思考文本 */
 export function thinkingOf(message?: AssistantMessage): string {
-    if (!message) return "";
-    return message.content
-        .filter(block => block.type === "thinking")
-        .map(block => block.thinking)
-        .join("\n")
-        .trim();
+    return message?.content.filter(block => block.type === "thinking").map(block => block.thinking).join("\n") ?? "";
 }
 
-/** 从消息序列中定位最后一条助手消息 */
-export function findLastAssistant(messages: AgentMessage[]): AssistantMessage | undefined {
-    return messages
-        .filter((m): m is AssistantMessage => m.role === "assistant")
-        .at(-1);
+/** 优先定位供应商真实的截断响应 */
+export function findLastAssistant(messages: AgentMessage[], summary?: GenerationAttempt): AssistantMessage | undefined {
+    return [...(summary?.calls ?? [])].reverse().find(call => call.stopReason === "length")?.response ??
+        summary?.calls.at(-1)?.response ?? messages.filter((message): message is AssistantMessage => message.role === "assistant").at(-1);
 }
 
-/** 识别截断发生在 Thinking、普通正文还是 ToolCall 参数阶段 */
-export function detectTruncationStage(
-    messages: AgentMessage[],
-    _summary?: GenerationAttempt
-): TruncationStage {
-    const lastAssistant = findLastAssistant(messages);
-    if (!lastAssistant) return "thinking";
-
-    const content = lastAssistant.content;
-    const hasToolCall = content.some(block => block.type === "toolCall");
-    const lastBlock = content.at(-1);
-
-    // 若末尾块或内容中包含工具调用，属于 ToolCall 参数阶段截断
-    if (hasToolCall && (lastBlock?.type === "toolCall" || !textOf(lastAssistant))) {
-        return "tool_call";
-    }
-
-    // 若已有非空正文输出，属于普通正文阶段截断
-    const rawText = textOf(lastAssistant);
-    if (rawText.length > 0) {
-        return "text";
-    }
-
-    // 仅有思考块或无文本无工具，属于 Thinking 阶段截断
-    return "thinking";
+/** 按真实响应识别工具参数、正文或思考截断 */
+export function detectTruncationStage(messages: AgentMessage[], summary?: GenerationAttempt): TruncationStage {
+    const content = findLastAssistant(messages, summary)?.content ?? [];
+    if (content.some(block => block.type === "toolCall")) return "tool_call";
+    return content.some(block => block.type === "text" && block.text.length > 0) ? "text" : "thinking";
 }
 
-/** 判断当前模型与 API 是否支持跨轮次复用未完成的推理思考状态 */
-export function canReuseReasoningState(_model: string): boolean {
-    /** 回传历史思考不等于恢复供应商内部推理状态，当前不启用精确续推 */
-    return false;
-}
-
-/** 从未完成的思考过程中提取关键任务检查点与规划大纲 */
+/** 提取有界的思考检查点，原始响应仍完整归档 */
 export function generateThinkingCheckpoint(thinkingText: string): string {
-    if (!thinkingText) return "已完成前期任务拆解与目标分析。";
-
-    // 优先提取思考中的关键规划句或结构化序号行
-    const lines = thinkingText.split("\n");
-    const keyLines = lines
-        .map(l => l.trim())
-        .filter(l => /^[0-9一二三四五]+[、. ]|^[-*] |(?:步骤|方案|设计|规划|目标|首先|其次|然后|接着|实现)/.test(l))
-        .slice(-8);
-
-    if (keyLines.length > 0) {
-        return keyLines.join("\n");
-    }
-
-    // 回退截取末尾 300 字符作为检查点上下文
-    return thinkingText.slice(-300).trim();
+    const lines = thinkingText.split("\n").filter(line => /步骤|方案|设计|规划|目标|实现|plan|implement|next/i.test(line)).slice(-8);
+    return [...lines, thinkingText.slice(-4096)].join("\n").slice(-6144);
 }
 
-/** 构造带历史末尾片段的精准无缝续写提示词 */
-export function buildContinuationPrompt(accumulatedText: string, checkpoint?: string): string {
-    const tailSnippet = accumulatedText.slice(-260).trim();
-    const checkpointNotice = checkpoint ? `【已规划检查点】\n${checkpoint}\n\n` : "";
-
-    return `${checkpointNotice}【系统续写指引】
-你的上一次回复因达到单次输出上限被截断。前文末尾内容为：
----
-...${tailSnippet}
----
-请紧接上述内容末尾无缝接续剩余内容。
-要求：严禁重复前文已有的任何字句、段落或代码围栏，直接输出后续正文或代码！`;
+/** 构造保留已有进展的阶段恢复指令 */
+export function buildRecoveryPrompt(stage: TruncationStage): string {
+    const instruction = stage === "tool_call"
+        ? "上一条工具调用参数生成被截断，整批调用均未执行。不要拼接残缺 JSON，请重新生成完整且较小的工具调用。长文件先用 write_file 创建较小的可运行骨架，再用 apply_patch 分步补齐，避免一次输出整个长文件。"
+        : stage === "text"
+            ? "上一条正文被截断。已有正文完整保留在上下文中，请从末尾直接输出剩余内容，不重复前文，不新增或补闭代码围栏，保留接续所需的空白和换行。"
+            : "上一阶段思考达到单次输出上限。请根据已保留的思考和工具结果直接执行剩余任务，避免重新规划。";
+    return `【截断恢复】${instruction}\n原始需求和已完成步骤已保留，请继续完成剩余工作，不要重复执行已有明确结果的操作。`;
 }
 
-/** 构造基于任务检查点的直接生成提示词（跳过冗余思考） */
-export function buildCheckpointPrompt(originalPrompt: string, checkpoint: string): string {
-    return `${originalPrompt}
-
-【系统指引：基于任务检查点直接输出】
-在上一阶段思考中，你已完成了如下核心设计与规划：
----
-${checkpoint}
----
-当前输出预算已达单次上限，请跳过冗余的思考过程，基于上述检查点直接输出最终完整的解决方案与代码！`;
-}
-
-/** 智能缝合多个续写片段，消除边界处的重叠冗余并保证格式连贯 */
+/** 原样拼接正文续写片段 */
 export function aggregateTextChunks(chunks: string[]): string {
-    const validChunks = chunks.map(c => c.trim()).filter(Boolean);
-    if (validChunks.length === 0) return "";
-    if (validChunks.length === 1) return validChunks[0];
-
-    let merged = validChunks[0];
-    for (let i = 1; i < validChunks.length; i++) {
-        const next = validChunks[i];
-        
-        // 探测前后片段是否存在 10~50 字符的重叠前缀/后缀
-        let overlap = 0;
-        const maxProbe = Math.min(60, merged.length, next.length);
-        for (let len = maxProbe; len >= 10; len--) {
-            const tail = merged.slice(-len);
-            if (next.startsWith(tail)) {
-                overlap = len;
-                break;
-            }
-        }
-
-        if (overlap > 0) {
-            merged += next.slice(overlap);
-        } else {
-            // 若上一个片段不是以换行结束且下一个片段不是标点开头，补充必要分隔
-            const lastChar = merged.slice(-1);
-            const needsNewline = !/[\n\r]/.test(lastChar);
-            merged += (needsNewline ? "\n" : "") + next;
-        }
-    }
-
-    return merged.trim();
+    return chunks.join("");
 }
 
-/** 清理消息序列中未生成完整的残损工具调用 */
-export function sanitizeIncompleteToolCalls(messages: AgentMessage[]): AgentMessage[] {
-    return messages.map(msg => {
-        if (msg.role !== "assistant") return msg;
-        const assistant = msg as AssistantMessage;
-        const sanitizedContent = assistant.content.filter(block => {
-            if (block.type !== "toolCall") return true;
-            // 剔除缺少 ID 或参数无法有效解析的残损 toolCall
-            if (!block.id || !block.name) return false;
-            try {
-                if (typeof block.arguments === "string") {
-                    JSON.parse(block.arguments);
-                }
-                return true;
-            } catch {
-                return false;
-            }
-        });
-        return {
-            ...assistant,
-            content: sanitizedContent
-        };
+/** 生成包含已完成结果和剩余目标的有界上下文检查点 */
+export function buildContextCheckpoint(messages: AgentMessage[], maxChars: number): string {
+    const calls = messages.filter((message): message is AssistantMessage => message.role === "assistant")
+        .flatMap(message => message.content.filter(block => block.type === "toolCall"));
+    const results = messages.filter(message => message.role === "toolResult").map(message => {
+        const args = calls.find(call => call.id === message.toolCallId)?.arguments;
+        const target = args && typeof args === "object" ? JSON.stringify(args).slice(0, 160) : "";
+        return { receipt: `${message.toolName} [${message.toolCallId}] ${message.isError ? "返回错误" : "已返回结果"} ${target}`,
+            detail: JSON.stringify(message.content) };
     });
+    const assistants = messages.filter((message): message is AssistantMessage => message.role === "assistant");
+    const last = assistants.at(-1);
+    const thinking = generateThinkingCheckpoint(thinkingOf(last));
+    const text = last?.content.filter(block => block.type === "text").map(block => block.text).join("") ?? "";
+    const intro = "【上下文检查点】原始需求见前文。已有明确结果的操作不要重复；继续完成原始需求中尚未完成的部分。";
+    const required = intro.length + results.reduce((sum, result) => sum + result.receipt.length + 2, 0) + 128;
+    if (required > maxChars) return "";
+    const share = Math.floor((maxChars - required) / (results.length + 2));
+    return [intro, ...results.map(result => result.receipt + "\n" + result.detail.slice(0, share)),
+        "最近思考与目标：\n" + (share ? thinking.slice(-share) : ""),
+        "最近正文末尾：\n" + (share ? text.slice(-share) : "")].join("\n");
 }

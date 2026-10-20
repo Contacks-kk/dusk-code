@@ -6,7 +6,7 @@ import { turn, message } from "../db/schema";
 import { sessionService } from "./session.service";
 import { AgentRunner } from "../agent/runner";
 import { getAppConfig } from "../config/env";
-import type { AgentRunResult, AgentExecutionStep } from "../agent/types";
+import type { AgentRunResult, AgentExecutionStep, ExecutionRecord } from "../agent/types";
 import { pruneHistoryContext, CONTEXT_LIMITS } from "../agent/context/pruner";
 import { estimateTokenCount } from "../agent/context/token";
 import { buildSystemPrompt } from "../agent/prompt";
@@ -175,6 +175,7 @@ export class AgentService {
             onStep?: (step: AgentExecutionStep) => void;
             onAskPermission?: (prompt: string) => Promise<boolean>;
             imagePaths?: string[];
+            signal?: AbortSignal;
         } | ((step: AgentExecutionStep) => void)
     ): Promise<AgentRunResult> {
         const config = getAppConfig();
@@ -231,6 +232,28 @@ export class AgentService {
         // 5. 每轮快照模型配置，重试沿用同一权限、输入与预算策略
         const currentPermissionMode = permissionManager.getMode();
         const systemPrompt = buildSystemPrompt({ permissionMode: currentPermissionMode });
+        const persistedSteps = new Set<string>();
+        /** 原子保存执行快照和新增工具步骤，重复检查点不重复插入 */
+        const saveCheckpoint = (snapshot: ExecutionRecord, steps: AgentExecutionStep[] = []): void => {
+            const newKeys: string[] = [];
+            db.transaction(tx => {
+                for (const step of steps) {
+                    const key = [step.attemptNo, step.callNo, step.toolCallId, step.type].join(":");
+                    if (persistedSteps.has(key) || newKeys.includes(key)) continue;
+                    if (step.type !== "tool_call" && step.type !== "tool_result") continue;
+                    tx.insert(message).values({
+                        turnId: createdTurn.id, role: step.type,
+                        content: JSON.stringify({
+                            tool: step.toolName, id: step.toolCallId, attemptNo: step.attemptNo, callNo: step.callNo,
+                            ...(step.type === "tool_call" ? { args: step.args } : { result: step.result, isError: step.isError })
+                        })
+                    }).run();
+                    newKeys.push(key);
+                }
+                tx.update(turn).set({ executionJson: snapshot }).where(eq(turn.id, createdTurn.id)).run();
+            });
+            for (const key of newKeys) persistedSteps.add(key);
+        };
 
         const runner = new AgentRunner({
             baseUrl: modelConfig.baseUrl || config.llm.baseUrl,
@@ -245,40 +268,16 @@ export class AgentService {
             initialMessages,
             onStep: opts.onStep,
             onAskPermission: opts.onAskPermission,
+            signal: opts.signal,
             /** 在下一次请求或工具执行前保存本次调用快照 */
-            onExecution: snapshot => {
-                db.update(turn).set({ executionJson: snapshot }).where(eq(turn.id, createdTurn.id)).run();
-            }
+            onExecution: saveCheckpoint
         });
 
         // 6. 编排状态机恢复算法并返回可持久化的最终执行结果
         const output = await runner.run(userInput, imageContents);
 
         // 7. 持久化工具调用过程及最终助手回复
-        for (const step of output.contextSteps) {
-            if (step.type === "tool_call") {
-                db.insert(message).values({
-                    turnId: createdTurn.id,
-                    role: "tool_call",
-                    content: JSON.stringify({
-                        tool: step.toolName,
-                        id: step.toolCallId,
-                        args: step.args
-                    })
-                }).run();
-            } else if (step.type === "tool_result") {
-                db.insert(message).values({
-                    turnId: createdTurn.id,
-                    role: "tool_result",
-                    content: JSON.stringify({
-                        tool: step.toolName,
-                        id: step.toolCallId,
-                        result: step.result,
-                        isError: step.isError
-                    })
-                }).run();
-            }
-        }
+        saveCheckpoint(output.execution, output.contextSteps);
 
         // 无论是否被截断，优先持久化打捞到的模型正文；无正文时持久化兜底说明，确保每轮会话数据完整
         const assistantContent = output.modelReply || output.reply;

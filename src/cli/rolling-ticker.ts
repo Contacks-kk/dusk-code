@@ -1,5 +1,6 @@
 import stringWidth from "string-width";
 import { colors, formatDuration } from "./theme";
+import { mouseTracker } from "./mouse-tracker";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -19,14 +20,14 @@ export class RollingTicker {
         if (chunk.length > 0 && chunk[0] === 3) {
             this.disableKeyboardSilence();
             process.stdout.write("\n");
-            process.exit(0);
+            process.emit("SIGINT");
         }
         // 其余输入（特别是 Enter \r \n）完全静音吞掉，不产生回显
     };
 
     /** 开启键盘静音拦截模式 */
     private enableKeyboardSilence(): void {
-        if (!process.stdin.isTTY || this.isStdinSilenced) return;
+        if (!process.stdin.isTTY || this.isStdinSilenced || mouseTracker.isActive()) return;
         try {
             process.stdin.setRawMode(true);
             process.stdin.resume();
@@ -135,8 +136,8 @@ export class RollingTicker {
         const totalChars = this.buffer.length;
         const timeText = formatDuration(durationMs ?? (Date.now() - this.startTime));
 
-        // 原地覆盖该行并换行
-        process.stdout.write(`\r  ${colors.gray}▸ Thought for ${timeText} (${totalChars.toLocaleString()} chars)  ${colors.dim}[已折叠 · Ctrl+O 展开 · /turn 详情]${colors.reset}\x1b[K\n`);
+        /** 保存此条思考快照供 Ctrl+O 查看，避免循环编号重用时混入其他原文 */
+        mouseTracker.writeThought(`Thought for ${timeText} (${totalChars.toLocaleString()} chars)`, this.buffer);
     }
 
     /** 清理当前行未闭合的刷新状态并解除键盘静音 */

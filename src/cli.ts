@@ -7,6 +7,7 @@ import { commandHandler } from "./cli/command-handler";
 import { colors, printHeaderBanner, renderLiveStep, renderAssistantReply, renderCrunchedSummary, printImageAttachmentBadge } from "./cli/theme";
 import { interactivePrompt, interactiveSelect } from "./cli/interactive-prompt";
 import { extractImagePaths } from "./utils/image";
+import { mouseTracker } from "./cli/mouse-tracker";
 
 /** 检测异常是否为 Ctrl+C 中断引发的取消错误 */
 function isAbortError(err: unknown): boolean {
@@ -24,12 +25,20 @@ function isAbortError(err: unknown): boolean {
 /** 启动现代化交互式终端 CLI */
 async function startCli(): Promise<void> {
     let currentSessionId: number | undefined;
+    let activeController: AbortController | undefined;
+    let exitRequested = false;
 
+    /** 取消活动任务，保存最终执行状态后退出 */
     const onSigInt = () => {
+        if (exitRequested) return;
+        exitRequested = true;
         console.log(`\n${colors.gray}检测到中断信号，正在安全退出...${colors.reset}`);
-        process.exit(0);
+        if (activeController) activeController.abort();
+        else process.exit(0);
     };
     process.on("SIGINT", onSigInt);
+    /** 接入共享键盘与思考详情，主界面保留原生终端滚动 */
+    mouseTracker.enable();
 
     // 1. 初始化并绑定当前工程上下文
     const currentProject = await projectService.getOrCreateProject(process.cwd());
@@ -58,8 +67,19 @@ async function startCli(): Promise<void> {
         return confirmed === true;
     };
 
+    /** 为所有 CLI 对话入口绑定统一取消控制器 */
+    const chat = async (prompt: string, imagePaths?: string[]) => {
+        activeController = new AbortController();
+        try {
+            return await agentService.chat(currentSessionId, prompt, {
+                projectId: currentProject.id, imagePaths, signal: activeController.signal,
+                onStep: renderLiveStep, onAskPermission: askUserPermission
+            });
+        } finally { activeController = undefined; }
+    };
+
     try {
-        while (true) {
+        while (!exitRequested) {
             const currentModelCfg = modelConfigManager.getModelConfig();
 
             // 调用 Codex CLI 风格输入器（暗色背景输入条 + 状态行 + 精确中文光标）
@@ -94,12 +114,7 @@ async function startCli(): Promise<void> {
                     printImageAttachmentBadge(imgData.imagePaths);
 
                     // 3.1 调用agent进行chat
-                    const result = await agentService.chat(currentSessionId, imgData.prompt, {
-                        projectId: currentProject.id,
-                        imagePaths: imgData.imagePaths,
-                        onStep: renderLiveStep,
-                        onAskPermission: askUserPermission
-                    });
+                    const result = await chat(imgData.prompt, imgData.imagePaths);
                     currentSessionId = result.sessionId;
 
                     // 3.2 渲染包含原生 Markdown
@@ -159,11 +174,7 @@ async function startCli(): Promise<void> {
                     const planPrompt = `【PLANNING 规划模式】请针对以下任务进行深入分析与调研规划。在此模式下，请仅使用只读工具（如 list_files, read_file, grep_search, git_status 等）查阅代码，切勿执行任何写操作或修改代码。请输出一份条理清晰、步骤明确的完整技术实施方案：\n\n${cmdArg}`;
 
                     console.log(`\n${colors.bold}● Plan: ${cmdArg}${colors.reset}\n`);
-                    const result = await agentService.chat(currentSessionId, planPrompt, {
-                        projectId: currentProject.id,
-                        onStep: renderLiveStep,
-                        onAskPermission: askUserPermission
-                    });
+                    const result = await chat(planPrompt);
                     currentSessionId = result.sessionId;
 
                     renderAssistantReply(result.reply, result.status);
@@ -197,12 +208,7 @@ async function startCli(): Promise<void> {
                 }
             }
 
-            const result = await agentService.chat(currentSessionId, activePrompt, {
-                projectId: currentProject.id,
-                imagePaths: attachedImages.length > 0 ? attachedImages : undefined,
-                onStep: renderLiveStep,
-                onAskPermission: askUserPermission
-            });
+            const result = await chat(activePrompt, attachedImages.length > 0 ? attachedImages : undefined);
             currentSessionId = result.sessionId;
 
             // 渲染最终回复（原生 Markdown 终端美化与耗时结算）
@@ -216,6 +222,7 @@ async function startCli(): Promise<void> {
             console.error(`\n${colors.red}运行异常:${colors.reset}`, err);
         }
     } finally {
+        mouseTracker.disable();
         process.off("SIGINT", onSigInt);
         console.log(`\n${colors.gray}=== DUSK CLI 已退出 ===${colors.reset}`);
     }
