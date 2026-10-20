@@ -93,7 +93,7 @@ export async function interactiveSelect<T>(
         };
 
         /** 响应键盘方向键与确认操作 */
-        const onKeypress = (_str: string, key: readline.Key) => {
+        const onKeypress = (str: string, key: readline.Key) => {
             if (!key) return;
 
             // 过滤鼠标逃逸序列
