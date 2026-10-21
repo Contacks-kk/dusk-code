@@ -14,7 +14,7 @@ export const gitDiffTool: AgentTool<typeof gitDiffParams> = {
     description: "查看代码修改前后的详细差异比对。在审查改动、确认代码变更正确性时使用。",
     parameters: gitDiffParams,
     /** 执行 git diff 命令并输出补丁格式的差异详情 */
-    execute: async (toolCallId, params) => {
+    execute: async (toolCallId, params, signal) => {
         try {
             const args = ["git diff"];
             if (params.staged) {
@@ -25,22 +25,40 @@ export const gitDiffTool: AgentTool<typeof gitDiffParams> = {
             }
 
             const command = args.join(" ");
-            const result = await shellAdapter.execute(command);
+            const result = await shellAdapter.execute(command, undefined, undefined, signal);
 
-            if (result.exitCode !== 0) {
-                if (result.stderr.includes("not a git repository")) {
+            if (result.aborted || result.timedOut || result.exitCode !== 0) {
+                if (!result.aborted && !result.timedOut && result.stderr.includes("not a git repository")) {
                     return {
                         content: [{ type: "text", text: "当前工作目录尚未初始化为 Git 仓库，无法比对 Git Diff。" }],
                         details: { isGitRepo: false }
                     };
                 }
+                const reason = result.aborted ? "操作已取消。" : result.timedOut ? "命令执行超时，已结束等待。" : "命令执行失败。";
                 return {
-                    content: [{ type: "text", text: `获取 Git Diff 失败: ${result.stderr}` }],
-                    details: { exitCode: result.exitCode, error: result.stderr }
+                    content: [{ type: "text", text: `获取 Git Diff 失败: ${reason}\n${result.stderr}`.trim() }],
+                    details: {
+                        exitCode: result.exitCode,
+                        error: result.stderr,
+                        timedOut: result.timedOut,
+                        aborted: result.aborted,
+                        outputIncomplete: result.outputIncomplete
+                    }
                 };
             }
 
             const diffText = result.stdout.trim();
+
+            // 输出未回收完整时保留原文，避免误报没有差异
+            if (result.outputIncomplete) {
+                return {
+                    content: [{ type: "text", text: `Git Diff 输出未完整回收，无法确认完整差异:\n${diffText}` }],
+                    details: {
+                        rawDiff: diffText,
+                        outputIncomplete: true
+                    }
+                };
+            }
             if (!diffText) {
                 return {
                     content: [{ type: "text", text: "当前没有检测到任何代码变更差异 (Diff 为空)。" }],

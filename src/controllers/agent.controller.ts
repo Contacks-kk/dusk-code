@@ -20,7 +20,7 @@ export class AgentController {
 
             if (!res.destroyed) res.json({ data: result });
         } catch (error: any) {
-            if (!res.destroyed) res.status(500).json({ error: error.message || "Agent 执行异常" });
+            if (!res.destroyed) res.status(error.statusCode ?? 500).json({ error: error.message || "Agent 执行异常" });
         } finally {
             res.off("close", disconnected);
         }
@@ -62,7 +62,7 @@ export class AgentController {
         } catch (error: any) {
             if (res.destroyed) return;
             if (!res.headersSent) {
-                res.status(500).json({ error: error.message || "Agent 执行异常" });
+                res.status(error.statusCode ?? 500).json({ error: error.message || "Agent 执行异常" });
             } else {
                 res.write(`data: ${JSON.stringify({ type: "error", error: error.message })}\n\n`);
                 res.end();

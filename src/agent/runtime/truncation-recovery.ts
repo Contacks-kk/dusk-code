@@ -40,26 +40,3 @@ export function buildRecoveryPrompt(stage: TruncationStage): string {
 export function aggregateTextChunks(chunks: string[]): string {
     return chunks.join("");
 }
-
-/** 生成包含已完成结果和剩余目标的有界上下文检查点 */
-export function buildContextCheckpoint(messages: AgentMessage[], maxChars: number): string {
-    const calls = messages.filter((message): message is AssistantMessage => message.role === "assistant")
-        .flatMap(message => message.content.filter(block => block.type === "toolCall"));
-    const results = messages.filter(message => message.role === "toolResult").map(message => {
-        const args = calls.find(call => call.id === message.toolCallId)?.arguments;
-        const target = args && typeof args === "object" ? JSON.stringify(args).slice(0, 160) : "";
-        return { receipt: `${message.toolName} [${message.toolCallId}] ${message.isError ? "返回错误" : "已返回结果"} ${target}`,
-            detail: JSON.stringify(message.content) };
-    });
-    const assistants = messages.filter((message): message is AssistantMessage => message.role === "assistant");
-    const last = assistants.at(-1);
-    const thinking = generateThinkingCheckpoint(thinkingOf(last));
-    const text = last?.content.filter(block => block.type === "text").map(block => block.text).join("") ?? "";
-    const intro = "【上下文检查点】原始需求见前文。已有明确结果的操作不要重复；继续完成原始需求中尚未完成的部分。";
-    const required = intro.length + results.reduce((sum, result) => sum + result.receipt.length + 2, 0) + 128;
-    if (required > maxChars) return "";
-    const share = Math.floor((maxChars - required) / (results.length + 2));
-    return [intro, ...results.map(result => result.receipt + "\n" + result.detail.slice(0, share)),
-        "最近思考与目标：\n" + (share ? thinking.slice(-share) : ""),
-        "最近正文末尾：\n" + (share ? text.slice(-share) : "")].join("\n");
-}

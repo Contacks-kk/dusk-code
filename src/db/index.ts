@@ -28,7 +28,7 @@ if (!fs.existsSync(dbPath)) {
     }
 }
 
-const sqlite = new Database(dbPath);
+export const sqlite = new Database(dbPath);
 
 migrateDatabase(sqlite);
 

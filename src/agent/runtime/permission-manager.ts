@@ -32,7 +32,8 @@ export const READ_TOOLS = new Set([
     "git_status",
     "git_diff",
     "get_current_time",
-    "calculator"
+    "calculator",
+    "recall_context"
 ]);
 
 /** 统一权限与沙箱边界管理器 */

@@ -8,6 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface AppConfig {
     port: number;
+    context: { windowTokens: number; compactionEnabled: boolean };
     llm: GenerationPolicy & {
         baseUrl: string;
         model: string;
@@ -41,6 +42,10 @@ export function getAppConfig(): AppConfig {
     const port = Number(process.env.PORT) || 4000;
     const baseUrl = process.env.LLM_BASE_URL || "";
     const model = process.env.LLM_MODEL || "deepseek-chat";
+    const windowTokens = Number(process.env.LLM_CONTEXT_WINDOW_TOKENS ?? 128000);
+    if (!Number.isSafeInteger(windowTokens) || windowTokens <= 4096) throw new Error("LLM_CONTEXT_WINDOW_TOKENS 必须为大于 4096 的整数");
+    const enabled = process.env.CONTEXT_COMPACTION_ENABLED ?? "true";
+    if (!["true", "false"].includes(enabled)) throw new Error("CONTEXT_COMPACTION_ENABLED 必须为 true 或 false");
     const apiKey = process.env.LLM_API_KEY || "";
     /** 读取并校验可配置的生成预算与可选超时配置 */
     const policy = generationPolicy({
@@ -55,6 +60,7 @@ export function getAppConfig(): AppConfig {
 
     return {
         port,
+        context: { windowTokens, compactionEnabled: enabled === "true" },
         llm: {
             ...policy,
             baseUrl,

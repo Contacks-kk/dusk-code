@@ -1,12 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { message } from "../db/schema";
 import { sessionService } from "../services/session.service";
 import { projectService } from "../services/project.service";
 import { permissionManager, type PermissionMode } from "../agent/runtime/permission-manager";
-import { estimateHistoryTokens, estimateTokenCount } from "../agent/context/token";
+import { agentService } from "../services/agent.service";
 import { colors, printFullAccessWarning, printHelpTable, formatPermissionBadge } from "./theme";
 import { interactiveSelect, type SelectItem } from "./interactive-prompt";
 import { modelConfigManager, type ReasoningEffort } from "../agent/runtime/model-config";
@@ -23,66 +20,22 @@ export class CommandHandler {
         const execution = history.at(-1)?.turn.executionJson;
         if (execution) console.log(`${colors.gray}上一轮状态: ${execution.status}，共 ${execution.attempts.length} 次尝试${colors.reset}\n`);
     }
-    /** 显式执行当前会话历史压缩，释放 Token 并输出对比看板 */
+    /** 显式压缩当前会话的模型视图，原始记录始终保留 */
     public async handleCompact(sessionId: number | undefined): Promise<void> {
         if (!sessionId) {
             console.log(`\n${colors.yellow}当前尚未创建会话，暂无可压缩的历史上下文。${colors.reset}\n`);
             return;
         }
-
-        const rawHistory = await sessionService.getSessionHistory(sessionId);
-        if (rawHistory.length === 0) {
-            console.log(`\n${colors.yellow}当前会话暂无历史消息，无需压缩。${colors.reset}\n`);
-            return;
-        }
-
-        const beforeTokens = estimateHistoryTokens(rawHistory);
-        let modifiedCount = 0;
-
-        // 对前序轮次中过长的大体积工具结果执行紧凑裁剪与持久化精简
-        for (const item of rawHistory) {
-            for (const msg of item.messages) {
-                if (msg.role === "tool_result") {
-                    const tokenCount = estimateTokenCount(msg.content);
-                    if (tokenCount > 500) {
-                        let compacted = msg.content;
-                        try {
-                            const parsed = JSON.parse(msg.content);
-                            if (typeof parsed.result === "string" && parsed.result.length > 200) {
-                                parsed.result = parsed.result.slice(0, 200) + "\n...[历史超长输出已紧凑压缩]...";
-                                compacted = JSON.stringify(parsed);
-                            } else if (typeof parsed.result === "object") {
-                                const str = JSON.stringify(parsed.result);
-                                if (str.length > 200) {
-                                    parsed.result = { summary: str.slice(0, 200) + "...", compressed: true };
-                                    compacted = JSON.stringify(parsed);
-                                }
-                            }
-                        } catch {
-                            compacted = msg.content.slice(0, 250) + "\n...[历史超长输出已紧凑压缩]...";
-                        }
-
-                        if (compacted !== msg.content) {
-                            db.update(message).set({ content: compacted }).where(eq(message.id, msg.id)).run();
-                            modifiedCount++;
-                        }
-                    }
-                }
-            }
-        }
-
-        const afterHistory = await sessionService.getSessionHistory(sessionId);
-        const afterTokens = estimateHistoryTokens(afterHistory);
-        const savedTokens = Math.max(0, beforeTokens - afterTokens);
-        const savedPercent = beforeTokens > 0 ? Math.round((savedTokens / beforeTokens) * 100) : 0;
-
-        console.log(`
-${colors.green}${colors.bold}✔ 上下文显式压缩完成${colors.reset}
-  ${colors.white}压缩前 Token:${colors.reset} ${colors.yellow}${beforeTokens}${colors.reset}
-  ${colors.white}压缩后 Token:${colors.reset} ${colors.green}${afterTokens}${colors.reset}
-  ${colors.white}释放 Token  :${colors.reset} ${colors.cyan}${savedTokens}${colors.reset} (${colors.bold}-${savedPercent}%${colors.reset})
-  ${colors.gray}精简大报文数: ${modifiedCount} 条${colors.reset}
-`);
+        const result = await agentService.compact(sessionId, text => console.log(`${colors.gray}${text}${colors.reset}`));
+        const saved = Math.max(0, result.beforeTokens - result.afterTokens);
+        const summaries = result.context.events.filter(event => event.kind === "summary").length;
+        const trims = result.context.events.filter(event => event.kind === "omission" || event.kind === "excerpt").length;
+        console.log(`\n${colors.green}上下文处理完成${colors.reset}
+  处理前估算: ${result.beforeTokens} token
+  处理后估算: ${result.afterTokens} token
+  释放空间  : ${saved} token
+  摘要记录  : ${summaries}，裁剪记录: ${trims}
+  原始历史保持完整，可通过 recall_context 定向回查。\n`);
     }
 
     /** 查看当前权限或使用交互式上下键菜单切换权限模式 */
