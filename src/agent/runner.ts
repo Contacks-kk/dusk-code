@@ -4,15 +4,14 @@ import type { AgentExecutionStep, ExecutionRecord, GenerationAttempt, Generation
 import { toolRegistry } from "./tools/registry";
 import { permissionManager, READ_TOOLS } from "./runtime/permission-manager";
 import { generationPolicy, isMiMoModel, type GenerationPolicy, type ReasoningEffort } from "./runtime/generation-policy";
-import { fitHistory } from "./context/budget";
-import { messageTokens } from "./context/token";
+import { ContextCoordinator } from "./context/coordinator";
+import { sourceMessage, type ContextMessage, type ContextPersistence } from "./context/types";
 import { historyToolId, restoreRecordedMessages } from "./context/history";
 import { prepareModelRequest } from "./runtime/model-adapter";
 import { salvageResponse, composeReply, composeIncompleteReport, type ResponseQuality, type SalvagedContent } from "./runtime/response-salvager";
 import {
     detectTruncationStage,
     buildRecoveryPrompt,
-    buildContextCheckpoint,
     aggregateTextChunks
 } from "./runtime/truncation-recovery";
 
@@ -22,6 +21,11 @@ export interface RunnerOptions extends Partial<GenerationPolicy> {
     apiKey: string;
     reasoningEffort?: ReasoningEffort;
     contextWindow?: number;
+    compactionEnabled?: boolean;
+    contextPersistence?: ContextPersistence;
+    currentTurnId?: number;
+    currentTurnNo?: number;
+    userMessageId?: number;
     systemPrompt?: string;
     initialMessages?: AgentMessage[];
     tools?: AgentTool<any>[];
@@ -69,6 +73,7 @@ export class AgentRunner {
     private readonly steps: AgentExecutionStep[] = [];
     private persistenceError?: string;
     private originalUser?: AgentMessage;
+    private contextCoordinator?: ContextCoordinator;
 
     /** 保存本轮模型连接与生成策略 */
     constructor(private readonly options: RunnerOptions) {
@@ -97,31 +102,21 @@ export class AgentRunner {
         return this.options.apiKey ? text.split(this.options.apiKey).join("[REDACTED]") : text;
     }
 
-    /** 为当前输出预算保留可容纳的完整历史轮次 */
-    private historyFor(history: AgentMessage[], pinned: AgentMessage[], maxTokens: number): AgentMessage[] {
-        /** 按整轮裁剪旧历史，同时固定本轮需求与有效进展 */
-        const fit = (current: AgentMessage[]) => [...fitHistory(history, current.reduce((sum, message) => sum + messageTokens(message), 0),
-            this.systemPrompt, this.tools, this.contextWindow, maxTokens), ...current];
-        try { return fit(pinned); }
-        catch (error) {
-            if (!this.originalUser) throw error;
-            for (let chars = 8192; chars >= 256; chars = Math.floor(chars / 2)) {
-                const checkpoint = buildContextCheckpoint(pinned, chars);
-                if (!checkpoint) continue;
-                const lastUser = pinned.filter(message => message.role === "user").at(-1);
-                const current: AgentMessage[] = [this.originalUser, { role: "user", content: checkpoint, timestamp: Date.now() }];
-                if (lastUser && lastUser !== this.originalUser) current.push(lastUser);
-                try {
-                    const fitted = fit(current);
-                    this.emit({ type: "status", content: "本轮上下文达到预算，已保留原始需求与执行结果检查点继续；完整响应仍已归档。" });
-                    return fitted;
-                } catch { /* 缩小运行时检查点，原始快照不变。 */ }
-            }
-            throw error;
+    /** 为循环中新生成的工具结果与恢复指令绑定稳定来源 */
+    private annotateCurrent(messages: AgentMessage[], summary: GenerationAttempt): void {
+        for (const message of messages as ContextMessage[]) {
+            if (message.contextSource) continue;
+            let ref = `t:${this.options.currentTurnId ?? 0}:recovery:${summary.attemptNo}`;
+            if (message.role === "toolResult") {
+                const ids = /^dusk_a(\d+)_c(\d+)_/.exec(message.toolCallId);
+                ref = `t:${this.options.currentTurnId ?? 0}:a:${ids?.[1] ?? summary.attemptNo}:c:${ids?.[2] ?? summary.calls.at(-1)?.callNo ?? 1}:tool:${message.toolCallId}`;
+            } else if (message === this.originalUser) ref = this.options.userMessageId ? `m:${this.options.userMessageId}` : `t:${this.options.currentTurnId ?? 0}:user`;
+            sourceMessage(message, ref, this.options.currentTurnId, this.options.currentTurnNo);
         }
     }
 
-    /** 执行一次独立 Agent 尝试并保留真实生成结束原因 */
+    /** 充当安全沙箱与治理中枢，在每一次独立的 ReAct 周期内，
+     * 负责上下文自动压缩、工具执行权限拦截、检查点落库、流式事件转译与异常数据打捞。*/
     private async attempt(
         prompt: string,
         images: ImageContent[] | undefined,
@@ -178,6 +173,17 @@ export class AgentRunner {
                 Authorization: `Bearer ${this.options.apiKey}`
             }
         };
+        this.contextCoordinator ??= new ContextCoordinator({
+            model,
+            apiKey: this.options.apiKey,
+            systemPrompt: this.systemPrompt,
+            tools: this.tools,
+            turnId: this.options.currentTurnId ?? 0,
+            enabled: this.options.compactionEnabled !== false,
+            persistence: this.options.contextPersistence,
+            onStatus: content => this.emit({ type: "status", content })
+        });
+        execution.context = this.contextCoordinator.record;
         /** 包装单次模型流，显式传递预算、思考开关和取消信号 */
         const streamFn: StreamFn = (callModel, context, options) => {
             if (options.signal?.aborted || this.options.signal?.aborted || originalLength || this.persistenceError) {
@@ -188,8 +194,8 @@ export class AgentRunner {
             /** 将 Agent 取消信号转发给当前模型请求 */
             const abort = () => controller.abort();
             options.signal?.addEventListener("abort", abort, { once: true });
-            const callStart = Date.now();
-            let lastTokenTime = callStart;
+            let callStart = 0;
+            let lastTokenTime = Date.now();
             let partial: AssistantMessage | undefined;
             let dirty = false;
             const call: GenerationCall = {
@@ -206,11 +212,9 @@ export class AgentRunner {
             };
             summary.calls.push(call);
             let timedOut = false;
-            const timeout = this.policy.generationTimeoutMs && this.policy.generationTimeoutMs > 0
-                ? setTimeout(() => { timedOut = true; controller.abort(); }, this.policy.generationTimeoutMs)
-                : undefined;
+            let timeout: ReturnType<typeof setTimeout> | undefined;
             const progress = setInterval(() => {
-                if (Date.now() - lastTokenTime >= 20000) {
+                if (callStart && Date.now() - lastTokenTime >= 20000) {
                     this.emit({
                         type: "status", attemptNo: summary.attemptNo,
                         content: `模型生成中，已等待 ${Math.floor((Date.now() - callStart) / 1000)} 秒；输出预算 ${summary.maxTokens} token`
@@ -221,7 +225,9 @@ export class AgentRunner {
             const captureResponse = (message: AssistantMessage): void => {
                 call.phase = "finished";
                 call.response = structuredClone(message);
-                if (call.response.errorMessage) call.response.errorMessage = this.safeError(call.response.errorMessage);
+                if (call.response.errorMessage) {
+                    call.response.errorMessage = this.safeError(call.response.errorMessage);
+                }
                 call.stopReason = message.stopReason;
                 call.usage = usageOf(message);
                 call.hasText = Boolean(textOf(message));
@@ -231,9 +237,13 @@ export class AgentRunner {
                 call.status = timedOut ? "timeout" : message.stopReason === "length" ? "truncated" :
                     message.stopReason === "error" ? "failed" : message.stopReason === "aborted" ? "aborted" :
                         call.hasText || call.toolCallCount ? "completed" : "empty";
-                if (message.errorMessage) call.error = this.safeError(message.errorMessage);
-                if (message.stopReason === "length") originalLength = call;
-                call.durationMs = Date.now() - callStart;
+                if (message.errorMessage) {
+                    call.error = this.safeError(message.errorMessage);
+                }
+                if (message.stopReason === "length") {
+                    originalLength = call;
+                }
+                call.durationMs = callStart ? Date.now() - callStart : 0;
                 summary.status = call.status;
                 summary.stopReason = call.stopReason;
                 summary.error = call.error;
@@ -257,42 +267,76 @@ export class AgentRunner {
             }, 2000);
             void (async () => {
                 try {
+                    /** 原文先落库，再为每次循环准备压缩或裁剪后的请求视图 */
                     onCallCompleted();
-                    if (summary.attemptNo === 1 && call.callNo === 1) this.originalUser = context.messages[oldHistoryLength];
-                    const requestContext = { ...context, messages: this.historyFor(context.messages.slice(0, oldHistoryLength),
-                        context.messages.slice(oldHistoryLength), summary.maxTokens) };
-                    const request = prepareModelRequest(requestContext, callModel, effort, options.onPayload);
-                    const source = streamSimple(
-                        callModel,
-                        request.context, {
-                        ...options,
-                        signal: controller.signal,
-                        maxTokens: summary.maxTokens,
-                        maxRetries: 0,
-                        timeoutMs: this.policy.generationTimeoutMs && this.policy.generationTimeoutMs > 0 ? this.policy.generationTimeoutMs : undefined,
-                        onPayload: request.onPayload
-                    });
-                    for await (const event of source) {
-                        lastTokenTime = Date.now();
-                        if ("partial" in event) { partial = event.partial; dirty = true; }
-                        if (event.type === "done" || event.type === "error") {
-                            const message = await source.result();
-                            partial = message;
-                            captureResponse(message);
-                            /** 先持久化完整响应，再让 Agent 继续执行工具或下一次请求 */
-                            onCallCompleted();
-                            if (event.type === "done") {
-                                const delivered = structuredClone(message);
-                                /** 截断调用只归档；给 Pi 完整临时副本使循环自然停止 */
-                                delivered.content = delivered.content.filter(block => block.type !== "toolCall" || message.stopReason !== "length");
-                                for (const block of delivered.content) {
-                                    if (block.type === "toolCall") block.id = historyToolId(summary.attemptNo, call.callNo, block.id);
-                                }
-                                stream.push({ ...event, message: delivered });
+                    if (summary.attemptNo === 1 && call.callNo === 1) {
+                        this.originalUser = context.messages[oldHistoryLength];
+                    }
+                    this.annotateCurrent(context.messages, summary);
+
+                    // 判断是否需要进行压缩，需要时则阻塞压缩，并向UI推送“正在压缩的消息
+                    let fitted = await this.contextCoordinator.prepare(context.messages, summary.maxTokens, controller.signal);
+
+                    controller.signal.throwIfAborted();
+                    onCallCompleted();
+                    /** 上下文准备完毕后才启动主模型的生成超时 */
+                    callStart = lastTokenTime = Date.now();
+                    if (this.policy.generationTimeoutMs) timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.policy.generationTimeoutMs);
+                    for (let overflowRetry = 0; overflowRetry < 2; overflowRetry++) {
+                        const request = prepareModelRequest({ ...context, messages: fitted }, callModel, effort, options.onPayload);
+                        const source = streamSimple(
+                            callModel,
+                            request.context, {
+                            ...options,
+                            signal: controller.signal,
+                            maxTokens: summary.maxTokens,
+                            maxRetries: 0,
+                            timeoutMs: this.policy.generationTimeoutMs && this.policy.generationTimeoutMs > 0 ? this.policy.generationTimeoutMs : undefined,
+                            onPayload: request.onPayload
+                        });
+                        let overflow = false;
+                        let pendingStart: { type: "start"; partial: AssistantMessage } | undefined;
+                        for await (const event of source) {
+                            lastTokenTime = Date.now();
+                            if (event.type === "start") {
+                                pendingStart = event;
                                 continue;
                             }
+                            if ("partial" in event) { partial = event.partial; dirty = true; }
+                            if (event.type === "done" || event.type === "error") {
+                                const message = await source.result();
+                                if (overflowRetry === 0 && message.stopReason === "error" && !message.content.length &&
+                                    /context.{0,40}(length|window|limit)|maximum context|too many tokens|prompt.{0,30}(too long|tokens)|上下文.*(超|长)/i.test(message.errorMessage ?? "")) {
+                                    overflow = true;
+                                    break;
+                                }
+                                partial = message;
+                                if (pendingStart) { stream.push(pendingStart); pendingStart = undefined; }
+                                captureResponse(message);
+                                this.contextCoordinator.observe(call.usage.inputTokens ?? 0);
+                                /** 先持久化完整响应，再让 Agent 继续执行工具或下一次请求 */
+                                onCallCompleted();
+                                if (event.type === "done") {
+                                    const delivered = structuredClone(message);
+                                    /** 截断调用只归档；给 Pi 完整临时副本使循环自然停止 */
+                                    delivered.content = delivered.content.filter(block => block.type !== "toolCall" || message.stopReason !== "length");
+                                    for (const block of delivered.content) {
+                                        if (block.type === "toolCall") block.id = historyToolId(summary.attemptNo, call.callNo, block.id);
+                                    }
+                                    sourceMessage(delivered, `t:${this.options.currentTurnId ?? 0}:a:${summary.attemptNo}:c:${call.callNo}`,
+                                        this.options.currentTurnId, this.options.currentTurnNo);
+                                    stream.push({ ...event, message: delivered });
+                                    continue;
+                                }
+                            }
+                            if (pendingStart) { stream.push(pendingStart); pendingStart = undefined; }
+                            stream.push(event);
                         }
-                        stream.push(event);
+                        if (!overflow) break;
+
+                        // 判断是否需要进行压缩，需要时则阻塞压缩，并向UI推送“正在压缩的消息
+                        fitted = await this.contextCoordinator.prepare(context.messages, summary.maxTokens, controller.signal, true);
+                        onCallCompleted();
                     }
                 } catch (error) {
                     call.phase = "finished";
@@ -336,7 +380,7 @@ export class AgentRunner {
                     }
                     stream.push({ type: "error", reason: message.stopReason as "error" | "aborted", error: message });
                 } finally {
-                    call.durationMs = Date.now() - callStart;
+                    call.durationMs = callStart ? Date.now() - callStart : 0;
                     if (timeout) clearTimeout(timeout);
                     clearInterval(progress);
                     clearInterval(checkpoint);
@@ -468,8 +512,13 @@ export class AgentRunner {
         this.options.signal?.addEventListener("abort", abortRun, { once: true });
         const startIndex = history.length;
         try {
-            if (this.options.signal?.aborted) summary.status = "aborted";
-            else await agent.prompt(prompt, images);
+            if (this.options.signal?.aborted) {
+                summary.status = "aborted";
+            }
+            else {
+                // 调用Pi的内层loop循环，请求模型->执行工具->把结果塞给上下文->再次请求模型
+                await agent.prompt(prompt, images);
+            }
         }
         catch (error) { summary.error = this.safeError(error); }
         finally { this.options.signal?.removeEventListener("abort", abortRun); }
@@ -492,11 +541,15 @@ export class AgentRunner {
         return { messages, modelReply, salvaged };
     }
 
+
+
+    
     /** 编排保留本轮进展的截断恢复并保存执行检查点 */
     public async run(prompt: string, images?: ImageContent[]): Promise<RunnerOutput> {
         const started = Date.now();
         this.steps.length = 0;
         this.persistenceError = undefined;
+        this.contextCoordinator = undefined;
         this.originalUser = {
             role: "user", timestamp: started,
             content: images?.length ? [{ type: "text", text: prompt }, ...images] : prompt
@@ -526,10 +579,13 @@ export class AgentRunner {
         };
         /** 通过统一投影还原跨恢复尝试的有效本轮消息 */
         const currentMessages = (): AgentMessage[] => restoreRecordedMessages({
-            turn: { executionJson: execution },
+            turn: { id: this.options.currentTurnId, turnNo: this.options.currentTurnNo, executionJson: execution },
             messages: settledSteps.filter(step => step.type === "tool_result").map(step => ({
                 role: "tool_result", createdAt: step.timestamp,
-                content: JSON.stringify({ id: step.toolCallId, tool: step.toolName, result: step.result, isError: step.isError })
+                content: JSON.stringify({
+                    id: step.toolCallId, tool: step.toolName, attemptNo: step.attemptNo, callNo: step.callNo,
+                    result: step.result, isError: step.isError
+                })
             }))
         }) ?? [];
         const maxRecoveryAttempts = 2;
@@ -542,6 +598,7 @@ export class AgentRunner {
         let continuation = false;
         let chunks: string[] = [];
 
+        // 外层自愈循环：用于解决超长输时的模型截断自动续写与自愈
         while (true) {
             const summary: GenerationAttempt = {
                 attemptNo: execution.attempts.length + 1, maxTokens,
@@ -553,8 +610,11 @@ export class AgentRunner {
             catch { contextError = this.persistenceError; break; }
             const history = summary.attemptNo === 1 ? this.options.initialMessages ?? [] :
                 [...this.options.initialMessages ?? [], this.originalUser, ...currentMessages()];
+
+            // 
             const result = await this.attempt(activePrompt, summary.attemptNo === 1 ? images : undefined,
                 history, summary, execution, persistExecution, effort);
+            
             messages = result.messages;
             latestSalvaged = result.salvaged;
             if (latestSalvaged.text) {
@@ -629,10 +689,10 @@ export class AgentRunner {
         const reply = this.persistenceError
             ? (modelReply ? modelReply + "\n\n" : "") + "⚠️ " + this.persistenceError + "，已停止后续请求与工具执行。"
             : execution.status === "completed" ? modelReply
-            : execution.status === "truncated" && execution.recoverySteps.length
-                ? composeIncompleteReport(finalSalvaged, last, execution.recoverySteps.length, last?.recoveryStage) +
+                : execution.status === "truncated" && execution.recoverySteps.length
+                    ? composeIncompleteReport(finalSalvaged, last, execution.recoverySteps.length, last?.recoveryStage) +
                     (contextError ? "\n" + contextError : "")
-                : composeReply(finalSalvaged, execution.status, last, execution.error, this.policy.generationTimeoutMs);
+                    : composeReply(finalSalvaged, execution.status, last, execution.error, this.policy.generationTimeoutMs);
         return {
             reply, modelReply, steps: [...this.steps], contextSteps: settledSteps,
             newMessages: [this.originalUser, ...currentMessages()],

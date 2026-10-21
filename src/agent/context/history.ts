@@ -2,10 +2,11 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExecutionRecord } from "../types";
 import { createHash } from "node:crypto";
+import { sourceMessage, type ContextMessage } from "./types";
 
 export interface StoredHistoryTurn {
-    turn: { executionJson?: ExecutionRecord | null };
-    messages: Array<{ role: string; content: string; createdAt?: Date | string | number | null }>;
+    turn: { id?: number; turnNo?: number; executionJson?: ExecutionRecord | null };
+    messages: Array<{ id?: number; role: string; content: string; createdAt?: Date | string | number | null }>;
 }
 
 /** 判断助手文本是否为运行时生成的状态说明 */
@@ -42,11 +43,13 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
             const text = Array.isArray(parsed.result?.content)
                 ? parsed.result.content.map((block: any) => block.text || "").join("\n")
                 : typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result) ?? "";
-            results.set(parsed.id, {
+            results.set(parsed.id, sourceMessage({
                 role: "toolResult", toolCallId: parsed.id, toolName: parsed.tool,
                 content: [{ type: "text", text }], isError: Boolean(parsed.isError),
                 timestamp: saved.createdAt ? new Date(saved.createdAt).getTime() : 0
-            });
+            }, parsed.attemptNo !== undefined && parsed.callNo !== undefined ? `t:${item.turn.id ?? 0}:a:${parsed.attemptNo}:c:${parsed.callNo}:tool:${parsed.id}` :
+                saved.id ? `m:${saved.id}` : `t:${item.turn.id ?? 0}:a:1:c:1:tool:${parsed.id}`,
+                item.turn.id, item.turn.turnNo));
         } catch {
             /** 无法还原的工具结果不参与调用配对 */
         }
@@ -79,7 +82,8 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
         }
         if (restored.content.some(block => block.type === "toolCall" ||
             (block.type === "thinking" ? block.thinking || block.thinkingSignature : block.text))) {
-            messages.push(restored);
+            messages.push(sourceMessage(restored, `t:${item.turn.id ?? 0}:a:${source.attemptNo}:c:${source.callNo}`,
+                item.turn.id, item.turn.turnNo));
         }
         if (paired) {
             for (const block of toolCalls) {
@@ -89,8 +93,27 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
     }
     if (!linked && savedReply && !replyRestored) {
         const last = calls.at(-1)!.response;
-        messages.push({ ...structuredClone(last), content: [{ type: "text", text: savedReply }],
-            stopReason: item.turn.executionJson?.status === "completed" ? "stop" : "length" });
+        const saved = item.messages.filter(saved => saved.role === "assistant" && !isRuntimeReply(saved.content)).at(-1);
+        messages.push(sourceMessage({ ...structuredClone(last), content: [{ type: "text", text: savedReply }],
+            stopReason: item.turn.executionJson?.status === "completed" ? "stop" : "length" },
+            saved?.id ? `m:${saved.id}` : `t:${item.turn.id ?? 0}:reply`, item.turn.id, item.turn.turnNo));
     }
     return messages;
+}
+
+/** 为旧版数据库投影补全消息来源 */
+export function annotateLegacyMessages(item: StoredHistoryTurn, messages: AgentMessage[]): void {
+    const remaining = [...item.messages];
+    for (const message of messages as ContextMessage[]) {
+        if (message.contextSource) continue;
+        const role = message.role === "toolResult" ? "tool_result" :
+            message.role === "assistant" && message.content.some(block => block.type === "toolCall") ? "tool_call" : message.role;
+        const index = remaining.findIndex(saved => saved.role === role);
+        const saved = index >= 0 ? remaining.splice(index, 1)[0] : undefined;
+        sourceMessage(message, saved?.id ? `m:${saved.id}` : `t:${item.turn.id ?? 0}:legacy:${messages.indexOf(message)}`,
+            item.turn.id, item.turn.turnNo);
+    }
+    const pending = Boolean(item.turn.executionJson?.pendingToolCallIds?.length || item.turn.executionJson?.attempts.some(attempt =>
+        attempt.calls.some(call => call.phase === "streaming" && call.response)));
+    if (pending) for (const message of messages as ContextMessage[]) message.contextSource!.protected = true;
 }

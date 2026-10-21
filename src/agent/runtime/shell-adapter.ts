@@ -6,6 +6,8 @@ export interface CommandExecutionResult {
     stderr: string;
     exitCode: number;
     timedOut: boolean;
+    aborted: boolean;
+    outputIncomplete: boolean;
 }
 
 /** 跨平台终端执行与命令安全防护适配器 */
@@ -43,9 +45,21 @@ export class ShellAdapter {
     public async execute(
         command: string,
         cwd: string = process.cwd(),
-        timeoutMs: number = 30000
+        timeoutMs: number = 30000,
+        signal?: AbortSignal
     ): Promise<CommandExecutionResult> {
         this.validateCommandSafety(command);
+
+        if (signal?.aborted) {
+            return {
+                stdout: "",
+                stderr: "",
+                exitCode: -1,
+                timedOut: false,
+                aborted: true,
+                outputIncomplete: false
+            };
+        }
 
         const targetCwd = path.isAbsolute(cwd) ? cwd : path.resolve(process.cwd(), cwd);
 
@@ -78,11 +92,66 @@ export class ShellAdapter {
             let stdout = "";
             let stderr = "";
             let timedOut = false;
+            let aborted = false;
+            let exited = false;
+            let settled = false;
+            let exitCode = -1;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            let drainTimer: ReturnType<typeof setTimeout> | undefined;
 
-            const timer = setTimeout(() => {
-                timedOut = true;
-                proc.kill();
-            }, timeoutMs);
+            /** 清理本次命令的等待资源并只返回一次结果 */
+            const finish = (outputIncomplete: boolean = false): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                clearTimeout(drainTimer);
+                signal?.removeEventListener("abort", onAbort);
+
+                // 后台进程可能仍持有管道，结束等待时只释放当前执行器的句柄
+                proc.stdin?.destroy();
+                proc.stdout.destroy();
+                proc.stderr.destroy();
+                proc.unref();
+                resolve({
+                    stdout: this.sanitizeOutput(stdout),
+                    stderr: this.sanitizeOutput(stderr),
+                    exitCode,
+                    timedOut,
+                    aborted,
+                    outputIncomplete
+                });
+            };
+
+            /** 尝试终止当前命令并结束超时或取消等待 */
+            const stop = (cancelled: boolean): void => {
+                if (settled) {
+                    return;
+                }
+                aborted = cancelled;
+                timedOut = !cancelled;
+
+                // Shell 已退出时保留后台进程，仅停止回收剩余输出
+                if (!exited) {
+                    try {
+                        if (!proc.kill()) {
+                            stderr += "\n未能确认命令进程已终止，子进程可能仍在运行。";
+                        }
+                    } catch (error) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        stderr += `\n终止命令进程失败: ${message}`;
+                    }
+                }
+
+                // 终止失败也必须返回，不能继续依赖进程或管道关闭
+                finish(!proc.stdout.readableEnded || !proc.stderr.readableEnded);
+            };
+
+            /** 响应用户取消并结束本次命令等待 */
+            const onAbort = (): void => {
+                stop(true);
+            };
 
             proc.stdout.on("data", (chunk) => {
                 stdout += chunk.toString();
@@ -92,25 +161,43 @@ export class ShellAdapter {
                 stderr += chunk.toString();
             });
 
-            proc.on("close", (code) => {
+            proc.once("exit", (code) => {
+                if (settled) {
+                    return;
+                }
+                exited = true;
+                exitCode = code ?? -1;
                 clearTimeout(timer);
-                resolve({
-                    stdout: this.sanitizeOutput(stdout),
-                    stderr: this.sanitizeOutput(stderr),
-                    exitCode: timedOut ? -1 : (code ?? 0),
-                    timedOut
-                });
+
+                // Shell 退出后最多再回收一秒输出，避免被后台进程持有的管道拖住
+                drainTimer = setTimeout(() => finish(true), 1000);
+            });
+
+            proc.once("close", (code) => {
+                if (settled) {
+                    return;
+                }
+                exitCode = code ?? exitCode;
+                finish();
             });
 
             proc.on("error", (err) => {
-                clearTimeout(timer);
-                resolve({
-                    stdout: this.sanitizeOutput(stdout),
-                    stderr: this.sanitizeOutput(`进程启动失败: ${err.message}`),
-                    exitCode: -1,
-                    timedOut: false
-                });
+                if (settled) {
+                    return;
+                }
+                stderr += `\n进程执行失败: ${err.message}`;
+
+                // 终止进程产生的错误由超时或取消分支统一收尾
+                if (!timedOut && !aborted) {
+                    finish();
+                }
             });
+
+            timer = setTimeout(() => stop(false), timeoutMs);
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                onAbort();
+            }
         });
     }
 }

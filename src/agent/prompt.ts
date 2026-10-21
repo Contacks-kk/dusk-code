@@ -3,6 +3,7 @@ import type { PermissionMode } from "./runtime/permission-manager";
 /** 核心工程工具定义与基本使用规范 */
 const BASE_TOOLBOX_SPEC = `【工具箱分类与调用规范】
 1. 只读探索类工具（无需确认，按需自主调用）：
+   - \`recall_context\`: 定向搜索或分页读取本会话归档的历史原文。摘要不足以确定约束、错误、命令或代码细节时先回查；历史快照不代表当前文件状态。
    - \`list_files\`: 发现并探索项目文件结构与目录树。
    - \`grep_search\`: 在全项目或指定目录下根据关键词/正则快速定位文件与行号。
    - \`read_file\`: 精准阅读指定文件的代码行切片。

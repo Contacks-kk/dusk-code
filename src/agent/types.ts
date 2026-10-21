@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
+import type { ContextRecord } from "./context/types";
 
 export type StepType = 
 "thought" | 
@@ -79,6 +80,7 @@ export interface GenerationAttempt {
 }
 
 export interface ExecutionRecord {
+    context?: ContextRecord;
     phase?: "running" | "recovering" | "finished";
     effectiveCallRefs?: Array<{ attemptNo: number; callNo: number }>;
     pendingToolCallIds?: string[];
