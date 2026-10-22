@@ -22,6 +22,7 @@ import { extractImagePaths } from "../utils/image";
 import { supportedEfforts } from "../agent/runtime/model-profile";
 import { turnInspector } from "./turn-inspector";
 import { turnHistoryManager } from "./turn-history";
+import { skillRegistry } from "../agent/skills/registry";
 
 export class CommandHandler {
     /** 展示恢复会话上一轮的执行结果 */
@@ -396,6 +397,79 @@ export class CommandHandler {
     public async handleTurn(arg?: string): Promise<void> {
         const turnNo = arg && /^\d+$/.test(arg.trim()) ? parseInt(arg.trim(), 10) : undefined;
         await turnInspector.open(turnNo);
+    }
+
+    /** 交互式查看可用技能或激活指定专属技能 */
+    public async handleSkill(arg?: string): Promise<void> {
+        const skillName = arg?.trim();
+
+        if (skillName) {
+            // 根据用户传入的技能名直接查询
+            const skill = await skillRegistry.get(skillName);
+
+            if (!skill) {
+                console.log(`\n${colors.yellow}未找到技能 "${skillName}"。输入 /skill 可查看所有可用技能列表。${colors.reset}\n`);
+                return;
+            }
+
+            console.log(`\n${colors.cyan}${colors.bold}● 专属技能: ${skill.name}${colors.reset} [来源: ${skill.source}]`);
+            console.log(`${colors.gray}描述: ${skill.description}${colors.reset}`);
+            console.log(`${colors.gray}路径: ${skill.path}${colors.reset}`);
+
+            if (skill.references.length > 0) {
+                console.log(`${colors.gray}配套参考文档:${colors.reset}`);
+                for (const ref of skill.references) {
+                    console.log(`  - ${ref.name}`);
+                }
+            }
+
+            console.log(`\n${colors.green}✔ 提示：该技能已装配在 Code Agent 提示词索引中，Agent 在相关任务中会自动调用 activate_skill。${colors.reset}\n`);
+            return;
+        }
+
+        // 获取全部已注册技能
+        const skills = await skillRegistry.getAll();
+
+        if (skills.length === 0) {
+            console.log(`\n${colors.yellow}当前未加载到任何可用技能。请检查 skills/ 或 .dusk/skills/ 目录。${colors.reset}\n`);
+            return;
+        }
+
+        // 构建交互式选择菜单项
+        const items: SelectItem<string>[] = skills.map((s) => {
+            return {
+                label: `${s.name} [${s.source}]`,
+                value: s.name,
+                hint: s.description.length > 40 ? s.description.slice(0, 37) + "..." : s.description
+            };
+        });
+
+        // 交互式上下键选择技能
+        const selectedName = await interactiveSelect(items, "请选择要查看或激活的专属技能");
+
+        if (!selectedName) {
+            return;
+        }
+
+        // 获取选中的技能并展示其元数据与参考资料
+        const selectedSkill = await skillRegistry.get(selectedName);
+
+        if (!selectedSkill) {
+            return;
+        }
+
+        console.log(`\n${colors.cyan}${colors.bold}● 专属技能: ${selectedSkill.name}${colors.reset} [来源: ${selectedSkill.source}]`);
+        console.log(`${colors.gray}描述: ${selectedSkill.description}${colors.reset}`);
+        console.log(`${colors.gray}路径: ${selectedSkill.path}${colors.reset}`);
+
+        if (selectedSkill.references.length > 0) {
+            console.log(`${colors.gray}配套参考文档:${colors.reset}`);
+            for (const ref of selectedSkill.references) {
+                console.log(`  - ${ref.name}`);
+            }
+        }
+
+        console.log(`\n${colors.green}✔ 提示：该技能已装配在 Code Agent 提示词索引中，Agent 在相关任务中会自动调用 activate_skill。${colors.reset}\n`);
     }
 }
 

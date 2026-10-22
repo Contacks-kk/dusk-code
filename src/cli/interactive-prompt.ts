@@ -16,6 +16,7 @@ export const SLASH_COMMANDS: CommandOption[] = [
     { name: "/image", description: "视图输入：自动提取剪贴板截图或加载拖拽图片进行视觉分析", requiresArg: true },
     { name: "/model", description: "模型调节：上下键切换模型与推理思考等级 (Reasoning Effort)" },
     { name: "/plan", description: "规划模式：深入只读调研代码并输出实施方案", requiresArg: true },
+    { name: "/skill", description: "技能系统：查看可用专业技能并按需交互式激活" },
     { name: "/permissions", description: "权限调节：上下键切换 Read Only / Workspace / Full Access" },
     { name: "/compact", description: "上下文压缩：显式压缩历史大报文并释放 Token" },
     { name: "/resume", description: "会话恢复：上下键选择当前工程历史会话" },

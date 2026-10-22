@@ -337,6 +337,7 @@ ${colors.cyan}${colors.bold}DUSK CLI 命令指引${colors.reset}
   ${colors.yellow}/image [路径] [任务]${colors.reset}    附加本地图片或自动提取剪贴板截图进行视图分析
   ${colors.yellow}/model [name] [effort]${colors.reset} 切换语言模型与推理等级: xhigh | high | medium | low | off
   ${colors.yellow}/plan <任务需求>${colors.reset}        显式进入规划模式，深入只读调研代码并输出实施计划
+  ${colors.yellow}/skill [name]${colors.reset}           浏览或激活内置/项目扩展技能 (如 code-review, bug-fix)
   ${colors.yellow}/permissions [mode]${colors.reset}    查看或切换权限: read-only | workspace | full-access
   ${colors.yellow}/compact${colors.reset}               显式压缩当前会话上下文，释放 Token 消耗
   ${colors.yellow}/turn [n]${colors.reset}              查看执行记录的完整思考过程、工具调用与响应结果

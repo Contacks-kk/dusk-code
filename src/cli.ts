@@ -11,6 +11,7 @@ import { extractImagePaths } from "./utils/image";
 import { mouseTracker } from "./cli/mouse-tracker";
 import { liveInputManager } from "./cli/live-input";
 import { isPlanConfirmationPrompt, promptPlanConfirmation } from "./cli/plan-confirmation";
+import { skillRegistry } from "./agent/skills/registry";
 import type { AgentRunResult } from "./agent/types";
 
 /** 检测异常是否为 Ctrl+C 中断引发的取消错误 */
@@ -46,6 +47,9 @@ async function startCli(): Promise<void> {
 
     // 1. 初始化并绑定当前工程上下文
     const currentProject = await projectService.getOrCreateProject(process.cwd());
+
+    // 初始化并预热加载多层级技能库
+    await skillRegistry.init(currentProject.rootPath);
 
     // 默认创建当前工程下的全新会话
     const initialSession = await sessionService.createSession("新对话", currentProject.id);
@@ -223,6 +227,11 @@ async function startCli(): Promise<void> {
 
                 if (cmd === "/turn" || cmd === "/turns" || cmd === "/inspect") {
                     await commandHandler.handleTurn(cmdArg);
+                    continue;
+                }
+
+                if (cmd === "/skill" || cmd === "/skills") {
+                    await commandHandler.handleSkill(cmdArg);
                     continue;
                 }
 

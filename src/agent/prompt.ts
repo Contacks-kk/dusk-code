@@ -1,4 +1,5 @@
 import type { PermissionMode } from "./runtime/permission-manager";
+import { skillRegistry } from "./skills/registry";
 
 /** 核心工程工具定义与基本使用规范 */
 const BASE_TOOLBOX_SPEC = `【工具箱分类与调用规范】
@@ -9,6 +10,8 @@ const BASE_TOOLBOX_SPEC = `【工具箱分类与调用规范】
    - \`read_file\`: 精准阅读指定文件的代码行切片。
    - \`git_status\`: 检查版本库工作区、暂存区与分支改动状态。
    - \`git_diff\`: 查看代码修改前后的详细差异比对。
+   - \`activate_skill\`: 遇到专业领域任务时（如前端审美优化、代码审查、Bug修复、代码库阅读、头脑风暴等），按需激活加载技能的执行规约与工作流。
+   - \`read_skill_reference\`: 查阅已激活技能所配套的专业参考手册（如多语言编码标准、UI美学指南等）。
 2. 变更落实类工具：
    - \`apply_patch\`: 【优先推荐】基于一段精确的旧代码替换为新代码，避免重写整个文件造成 Token 损耗。
    - \`write_file\`: 用于新建文件，或文件被全量重构且无法精准局部匹配时使用。
@@ -60,10 +63,15 @@ export function buildSystemPrompt(options: {
     const mode = options.permissionMode || "workspace";
     const workflow = buildWorkflowPolicy(mode);
 
+    // 动态提取当前已注册的技能目录清单
+    const skillCatalog = skillRegistry.generatePromptCatalog();
+
     return `你是一个具备完整工程工具调用能力的专业 Code Agent（编程智能体）。
 你可以使用本地核心工程工具协助用户进行代码探索、阅读、修改、测试与版本控制。
 
 ${BASE_TOOLBOX_SPEC}
+
+${skillCatalog}
 
 ${workflow}
 `;

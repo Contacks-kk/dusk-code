@@ -9,6 +9,7 @@ import { writeFileTool } from "./code/write-file.tool";
 import { executeCommandTool } from "./code/execute-command.tool";
 import { gitStatusTool } from "./code/git-status.tool";
 import { gitDiffTool } from "./code/git-diff.tool";
+import { activateSkillTool, readSkillReferenceTool } from "./skill/skill.tool";
 
 class ToolRegistry {
     private tools: Map<string, AgentTool<any>> = new Map();
@@ -27,6 +28,10 @@ class ToolRegistry {
         this.register(executeCommandTool);
         this.register(gitStatusTool);
         this.register(gitDiffTool);
+
+        // 核心技能按需激活与手册查阅工具
+        this.register(activateSkillTool);
+        this.register(readSkillReferenceTool);
     }
 
     /** 注册新工具到注册中心 */
