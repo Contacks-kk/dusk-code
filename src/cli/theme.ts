@@ -27,13 +27,16 @@ export function formatDuration(ms: number): string {
     if (ms < 1000) {
         return `${Math.round(ms)}ms`;
     }
-    const totalSeconds = Math.round(ms / 1000);
-    if (totalSeconds < 60) {
-        return `${totalSeconds}s`;
+
+    const seconds = ms / 1000;
+    if (seconds < 60) {
+        return `${seconds.toFixed(1)}s`;
     }
+
+    const totalSeconds = Math.round(seconds);
     const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return `${minutes}m ${seconds}s`;
+    const remainingSeconds = totalSeconds % 60;
+    return `${minutes}m ${remainingSeconds}s`;
 }
 
 /** 格式化权限模式标签 */
@@ -206,11 +209,11 @@ export function renderThought(durationMs: number, turnNo = 1): void {
     rollingTicker.finish(durationMs);
 }
 
-/** 渲染单轮全流程耗时总结（Claude Code ✻ Crunched 样式） */
+/** 渲染单轮从用户输入到 Assistant 输出截止的全链路耗时总结 */
 export function renderCrunchedSummary(totalMs: number): void {
     rollingTicker.flush();
     turnHistoryManager.recordOutputLines(3);
-    console.log(`\n${colors.cyan}✻ Crunched for ${formatDuration(totalMs)}${colors.reset}\n`);
+    console.log(`\n${colors.cyan}✻ Completed in ${formatDuration(totalMs)} (本轮耗时: ${formatDuration(totalMs)})${colors.reset}\n`);
 }
 
 /** 渲染思考、工具和中间回复，隐藏内部循环编号 */
@@ -286,10 +289,11 @@ export function printHeaderBanner(info: {
     permissionMode: PermissionMode;
     modelName?: string;
     reasoningEffort?: string;
+    reasoningDisplay?: string;
 }): void {
     const permBadge = formatPermissionBadge(info.permissionMode);
     const sessionText = info.sessionId ? `#${info.sessionId}` : "(未创建，首次发送自动生成)";
-    const modelText = `${colors.bold}${info.modelName || "deepseek-chat"}${colors.reset} ${colors.gray}(${reasoningLabel(info.modelName || "deepseek-chat", info.reasoningEffort || "high")})${colors.cyan}`;
+    const modelText = `${colors.bold}${info.modelName || "deepseek-chat"}${colors.reset} ${colors.gray}(${info.reasoningDisplay ?? reasoningLabel(info.modelName || "deepseek-chat", info.reasoningEffort || "high")})${colors.cyan}`;
 
     console.log(`
 ${colors.cyan}╭─────────────────────────────────────────────────────────────────────────────╮

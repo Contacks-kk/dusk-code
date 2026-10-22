@@ -1,9 +1,10 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ImageContent, Model } from "@mariozechner/pi-ai";
+import type { ImageContent } from "@mariozechner/pi-ai";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { turn, message } from "../db/schema";
 import { sessionService } from "./session.service";
+import { titleService } from "./title.service";
 import { AgentRunner } from "../agent/runner";
 import { getAppConfig } from "../config/env";
 import type { AgentRunResult, AgentExecutionStep, ExecutionRecord } from "../agent/types";
@@ -16,6 +17,8 @@ import { contextEntries, applyContextArtifacts } from "../agent/context/view";
 import { requestTokens } from "../agent/context/token";
 import { buildSystemPrompt } from "../agent/prompt";
 import { permissionManager } from "../agent/runtime/permission-manager";
+import { sdkModel } from "../agent/runtime/model-profile";
+import type { RequestDiagnostics } from "../agent/runtime/model-adapter";
 import { modelConfigManager } from "../agent/runtime/model-config";
 import { loadImageAsImageContent } from "../utils/image";
 import { restoreRecordedMessages, annotateLegacyMessages } from "../agent/context/history";
@@ -29,17 +32,14 @@ export class AgentService {
         try {
             const config = getAppConfig();
             const selected = modelConfigManager.getModelConfig();
-            const model: Model<"openai-completions"> = { id: selected.model, name: selected.model, api: "openai-completions", provider: "openai",
-                baseUrl: (selected.baseUrl || config.llm.baseUrl).replace(/\/+$/, "").replace(/\/(?:chat\/completions|responses)$/i, ""), reasoning: false,
-                input: ["text", "image"], contextWindow: config.context.windowTokens, maxTokens: selected.maxTokens,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+            const model = sdkModel(selected.capabilities);
             const systemPrompt = buildSystemPrompt({ permissionMode: permissionManager.getMode() });
             const tools = [...toolRegistry.getAll(), createRecallTool(store)];
             const messages = await this.convertDbMessagesToAgent(await sessionService.getSessionHistory(sessionId));
             const before = applyContextArtifacts(contextEntries(messages), store.artifacts).flatMap(entry => entry.messages);
-            const coordinator = new ContextCoordinator({ model, apiKey: selected.apiKey || config.llm.apiKey, systemPrompt, tools,
+            const coordinator = new ContextCoordinator({ model, capabilities: selected.capabilities, apiKey: selected.apiKey || config.llm.apiKey, systemPrompt, tools,
                 turnId: -1, enabled: true, persistence: store, onStatus });
-            await coordinator.prepare(messages, selected.maxTokens, signal, false, true);
+            await coordinator.prepare(messages, Math.min(selected.maxTokens, selected.capabilities.maxOutputTokens ?? selected.maxTokens), signal, false, true);
             return { beforeTokens: requestTokens(before, systemPrompt, tools), afterTokens: coordinator.record.estimatedInputTokens,
                 context: coordinator.record };
         } finally { store.release(); }
@@ -229,8 +229,7 @@ export class AgentService {
         // 1. 获取或创建 Session（绑定所属工程）
         let targetSession = sessionId ? await sessionService.getSessionById(sessionId) : undefined;
         if (!targetSession) {
-            const initialTitle = userInput.slice(0, 30) || "新对话";
-            targetSession = await sessionService.createSession(initialTitle, opts.projectId);
+            targetSession = await sessionService.createSession("新对话", opts.projectId);
         }
 
         const contextStore = new ContextStore(sqlite, targetSession.id, history => this.convertDbMessagesToAgent(history));
@@ -238,6 +237,11 @@ export class AgentService {
         try {
             /** 原始历史仅投影，不在入口预先截短或删除 */
             const rawHistory = await sessionService.getSessionHistory(targetSession.id);
+
+            // 2. 当会话未设置定制标题或处于首轮问答阶段时，异步启动线程提炼标题
+            const needsTitle = rawHistory.length === 0 || !targetSession.title || targetSession.title === "新对话";
+            const auxiliaryRequests: RequestDiagnostics[] = [];
+
             const persistentContent = imagePaths.length > 0
                 ? JSON.stringify({ text: userInput, imagePaths })
                 : userInput;
@@ -262,6 +266,7 @@ export class AgentService {
             const currentPermissionMode = permissionManager.getMode();
             const systemPrompt = buildSystemPrompt({ permissionMode: currentPermissionMode });
             const persistedSteps = new Set<string>();
+
             /** 原子保存执行快照和新增工具步骤，重复检查点不重复插入 */
             const saveCheckpoint = (snapshot: ExecutionRecord, steps: AgentExecutionStep[] = []): void => {
                 contextStore.assertLease();
@@ -286,12 +291,14 @@ export class AgentService {
             };
 
             const runner = new AgentRunner({
+                auxiliaryRequests,
                 baseUrl: modelConfig.baseUrl || config.llm.baseUrl,
                 model: modelConfig.model || config.llm.model,
                 apiKey: modelConfig.apiKey || config.llm.apiKey,
                 reasoningEffort: modelConfig.reasoningEffort,
                 systemPrompt,
-                contextWindow: config.context.windowTokens,
+                contextWindow: modelConfig.capabilities.contextWindow,
+                capabilities: modelConfig.capabilities,
                 compactionEnabled: config.context.compactionEnabled,
                 contextPersistence: contextStore,
                 currentTurnId: createdTurn.id,
@@ -309,10 +316,27 @@ export class AgentService {
                 onExecution: saveCheckpoint
             });
 
+            // 标题与主任务并行，迟到的诊断只补充当前轮执行记录
+            if (needsTitle) {
+                titleService.generateSessionTitleAsync(targetSession.id, userInput, modelConfig, diagnostics => {
+                    auxiliaryRequests.push(diagnostics);
+                    try {
+                        db.transaction(tx => {
+                            const stored = tx.select({ executionJson: turn.executionJson }).from(turn).where(eq(turn.id, createdTurn.id)).get();
+                            if (stored?.executionJson) {
+                                tx.update(turn).set({ executionJson: { ...stored.executionJson, auxiliaryRequests } }).where(eq(turn.id, createdTurn.id)).run();
+                            }
+                        });
+                    } catch {
+                        // 标题诊断写入失败不影响主任务检查点
+                    }
+                });
+            }
+
             // 6. 编排状态机恢复算法并返回可持久化的最终执行结果
             const output = await runner.run(userInput, imageContents);
 
-            // 7. 持久化工具调用过程及最终助手回复
+            // 7. 持久化工具调用过程及最终助手回复（更新DB数据）
             saveCheckpoint(output.execution, output.contextSteps);
 
             // 无论是否被截断，优先持久化打捞到的模型正文；无正文时持久化兜底说明，确保每轮会话数据完整

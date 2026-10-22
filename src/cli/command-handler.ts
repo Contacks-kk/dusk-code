@@ -4,12 +4,22 @@ import { sessionService } from "../services/session.service";
 import { projectService } from "../services/project.service";
 import { permissionManager, type PermissionMode } from "../agent/runtime/permission-manager";
 import { agentService } from "../services/agent.service";
-import { colors, printFullAccessWarning, printHelpTable, formatPermissionBadge } from "./theme";
+import {
+    colors,
+    printFullAccessWarning,
+    printHelpTable,
+    formatPermissionBadge,
+    formatToolHeader,
+    formatToolBranchResult,
+    renderAssistantReply,
+    renderCrunchedSummary,
+    printImageAttachmentBadge
+} from "./theme";
 import { interactiveSelect, type SelectItem } from "./interactive-prompt";
 import { modelConfigManager, type ReasoningEffort } from "../agent/runtime/model-config";
 import { saveClipboardImage } from "../utils/clipboard";
 import { extractImagePaths } from "../utils/image";
-import { isMiMoModel, reasoningLabel } from "../agent/runtime/generation-policy";
+import { supportedEfforts } from "../agent/runtime/model-profile";
 import { turnInspector } from "./turn-inspector";
 import { turnHistoryManager } from "./turn-history";
 
@@ -18,7 +28,125 @@ export class CommandHandler {
     private async showExecutionStatus(sessionId: number): Promise<void> {
         const history = await sessionService.getSessionHistory(sessionId);
         const execution = history.at(-1)?.turn.executionJson;
-        if (execution) console.log(`${colors.gray}上一轮状态: ${execution.status}，共 ${execution.attempts.length} 次尝试${colors.reset}\n`);
+        if (execution) {
+            console.log(`${colors.gray}上一轮状态: ${execution.status}，共 ${execution.attempts.length} 次尝试${colors.reset}\n`);
+        }
+    }
+
+    /** 将已恢复会话的全部历史轮次和工具执行记录渲染到当前终端中 */
+    public async renderSessionHistory(sessionId: number): Promise<void> {
+        // 清理当前内存中的轮次历史状态
+        turnHistoryManager.reset();
+
+        // 查询指定会话的完整轮次记录
+        const history = await sessionService.getSessionHistory(sessionId);
+        if (history.length === 0) {
+            console.log(`\n${colors.gray}(当前会话暂无历史问答记录)${colors.reset}\n`);
+            return;
+        }
+
+        console.log(`\n${colors.cyan}╭──────────────────────── 历史会话记录 (#${sessionId}) ────────────────────────╮${colors.reset}`);
+
+        for (const item of history) {
+            const turnNo = item.turn.turnNo;
+            turnHistoryManager.recordTurnStart(turnNo);
+
+            // 1. 提取并渲染用户提问内容与附加图片
+            const userMsg = item.messages.find((m) => m.role === "user");
+            if (userMsg) {
+                let userText = userMsg.content;
+                let attachedImages: string[] = [];
+
+                if (userText.startsWith("{") && userText.endsWith("}")) {
+                    try {
+                        const parsed = JSON.parse(userText);
+                        if (parsed && typeof parsed.text === "string") {
+                            userText = parsed.text;
+                            if (Array.isArray(parsed.imagePaths)) {
+                                attachedImages = parsed.imagePaths;
+                            }
+                        }
+                    } catch {
+                        // 忽略解析错误
+                    }
+                }
+
+                console.log(`\n${colors.cyan}● User [第 ${turnNo} 轮]${colors.reset}\n${userText}`);
+                if (attachedImages.length > 0) {
+                    printImageAttachmentBadge(attachedImages);
+                }
+            }
+
+            // 2. 提取并渲染工具调用过程，并同步装配至 turnHistoryManager
+            const toolCallMsgs = item.messages.filter((m) => m.role === "tool_call");
+            const toolResultMsgs = item.messages.filter((m) => m.role === "tool_result");
+
+            for (const tcMsg of toolCallMsgs) {
+                try {
+                    const parsedTc = JSON.parse(tcMsg.content);
+                    const matchedRes = toolResultMsgs.find((trMsg) => {
+                        try {
+                            const parsedTr = JSON.parse(trMsg.content);
+                            return parsedTr.id === parsedTc.id;
+                        } catch {
+                            return false;
+                        }
+                    });
+
+                    let resVal: any = undefined;
+                    let isError = false;
+                    let durationMs: number | undefined;
+
+                    if (matchedRes) {
+                        try {
+                            const parsedTr = JSON.parse(matchedRes.content);
+                            resVal = parsedTr.result;
+                            isError = !!parsedTr.isError;
+                            durationMs = parsedTr.durationMs;
+                        } catch {
+                            // 忽略结果解析异常
+                        }
+                    }
+
+                    // 记录工具调用到历史管理器
+                    turnHistoryManager.recordToolCall(turnNo, {
+                        id: parsedTc.id || "",
+                        name: parsedTc.tool || "tool",
+                        args: parsedTc.args || {}
+                    });
+
+                    if (matchedRes) {
+                        turnHistoryManager.recordToolResult(
+                            turnNo,
+                            parsedTc.id || "",
+                            resVal,
+                            durationMs,
+                            isError
+                        );
+                    }
+
+                    console.log(`\n${formatToolHeader(parsedTc.tool || "tool", parsedTc.args)}`);
+                    const branchLine = formatToolBranchResult(parsedTc.tool || "tool", resVal, durationMs, isError);
+                    console.log(branchLine);
+                } catch {
+                    // 忽略无效工具 JSON
+                }
+            }
+
+            // 3. 提取并渲染助手回复内容
+            const assistantMsg = item.messages.find((m) => m.role === "assistant");
+            if (assistantMsg) {
+                renderAssistantReply(assistantMsg.content, item.turn.executionJson?.status);
+            }
+
+            // 4. 渲染耗时总结与标记轮次结束
+            turnHistoryManager.finishTurn(turnNo);
+            if (item.turn.executionJson?.totalDurationMs) {
+                renderCrunchedSummary(item.turn.executionJson.totalDurationMs);
+            }
+        }
+
+        console.log(`${colors.cyan}╰────────────────────────────────────────────────────────────────────────╯${colors.reset}\n`);
     }
     /** 显式压缩当前会话的模型视图，原始记录始终保留 */
     public async handleCompact(sessionId: number | undefined): Promise<void> {
@@ -118,6 +246,10 @@ export class CommandHandler {
             }
 
             const found = sessions.find((s) => s.id === selectedSessionId);
+
+            // 渲染恢复会话的历史记录至控制台
+            await this.renderSessionHistory(selectedSessionId);
+
             console.log(`\n${colors.green}✔ 已恢复当前会话为 #${selectedSessionId} [${found?.title || "未命名会话"}]${colors.reset}\n`);
             await this.showExecutionStatus(selectedSessionId);
             return selectedSessionId;
@@ -135,6 +267,9 @@ export class CommandHandler {
             return null;
         }
 
+        // 渲染恢复会话的历史记录至控制台
+        await this.renderSessionHistory(foundSession.id);
+
         console.log(`\n${colors.green}✔ 已恢复当前会话为 #${foundSession.id} [${foundSession.title || "未命名会话"}]${colors.reset}\n`);
         await this.showExecutionStatus(foundSession.id);
         return foundSession.id;
@@ -147,15 +282,15 @@ export class CommandHandler {
         if (trimmed) {
             const parts = trimmed.split(/\s+/);
             const targetModel = parts[0];
-            const targetEffort = (parts[1]?.toLowerCase() as ReasoningEffort) || "high";
+            const targetEffort = parts[1]?.toLowerCase();
 
-            modelConfigManager.setModel(targetModel);
-            if (["xhigh", "high", "medium", "low", "off"].includes(targetEffort)) {
-                modelConfigManager.setReasoningEffort(targetEffort);
+            modelConfigManager.configureModel(targetModel, targetEffort);
+            for (const warning of modelConfigManager.getModelConfig().capabilities.warnings) {
+                console.log(`${colors.yellow}${warning}${colors.reset}`);
             }
 
             console.log(
-                `\n${colors.green}✔ 模型配置已更新:${colors.reset} ${colors.bold}${targetModel}${colors.reset} (${colors.yellow}${reasoningLabel(targetModel, modelConfigManager.getModelConfig().reasoningEffort)}${colors.reset})\n`
+                `\n${colors.green}✔ 模型配置已更新:${colors.reset} ${colors.bold}${targetModel}${colors.reset} (${colors.yellow}${modelConfigManager.getDisplayLabel().effort}${colors.reset})\n`
             );
             return;
         }
@@ -181,35 +316,34 @@ export class CommandHandler {
         }
 
         // 阶段 2：选择推理思考等级
-        const effortOptions: SelectItem<ReasoningEffort>[] = isMiMoModel(selectedModel) ? [
-            { label: "开启思考", value: "high", hint: "MiMo 使用开关模式，不区分 high/medium 等等级" },
-            { label: "关闭思考", value: "off", hint: "优先生成正文与工具调用" }
-        ] : [
-            { label: "xhigh", value: "xhigh", hint: "极限深度思考，适合高难度复杂算法" },
-            { label: "high", value: "high", hint: "深度思考，推荐代码架构与重构 (默认)" },
-            { label: "medium", value: "medium", hint: "均衡思考，常规功能开发" },
-            { label: "low", value: "low", hint: "轻量思考，快速响应" },
-            { label: "off", value: "off", hint: "标准模式，不开启深度思考" }
-        ];
+        const profile = modelConfigManager.resolveModel(selectedModel);
+        const efforts = profile.thinkingControl === "mimo" ? supportedEfforts(profile).filter(effort => effort === "off" || effort === "high") : supportedEfforts(profile);
+        const effortOptions: SelectItem<ReasoningEffort>[] = efforts.map(effort => ({
+            label: profile.thinkingControl === "mimo" ? (effort === "off" ? "关闭思考" : "开启思考") : effort,
+            value: effort,
+            hint: `${profile.thinkingLevelMap?.[effort] ? `实际映射为 ${profile.thinkingLevelMap[effort]}` : "当前模型支持的设置"}${profile.verified ? "" : "；适配未验证"}`
+        }));
+        const selectedEffort = await interactiveSelect(effortOptions, `请选择思考设置 (当前: ${modelConfigManager.getDisplayLabel().effort})`);
 
-        const selectedEffort = await interactiveSelect(effortOptions, `请选择思考设置 (当前: ${reasoningLabel(currentConfig.model, currentConfig.reasoningEffort)})`);
         if (!selectedEffort) {
             return;
         }
 
-        modelConfigManager.setModel(selectedModel);
-        modelConfigManager.setReasoningEffort(selectedEffort);
+        modelConfigManager.configureModel(selectedModel, selectedEffort);
+        for (const warning of modelConfigManager.getModelConfig().capabilities.warnings) {
+            console.log(`${colors.yellow}${warning}${colors.reset}`);
+        }
 
         console.log(
-            `\n${colors.green}✔ 运行模型已切换为:${colors.reset} ${colors.bold}${selectedModel}${colors.reset} (${colors.yellow}${reasoningLabel(selectedModel, selectedEffort)}${colors.reset})\n`
+            `\n${colors.green}✔ 运行模型已切换为:${colors.reset} ${colors.bold}${selectedModel}${colors.reset} (${colors.yellow}${modelConfigManager.getDisplayLabel().effort}${colors.reset})\n`
         );
     }
 
-    /** 开启全新独立会话 */
-    public handleNew(): null {
+    /** 开启全新独立会话并输出提示 */
+    public handleNew(newSessionId?: number): void {
         turnHistoryManager.reset();
-        console.log(`\n${colors.green}✔ 已开启全新会话${colors.reset} ${colors.gray}(下一条消息将自动创建全新会话上下文)${colors.reset}\n`);
-        return null;
+        const idLabel = newSessionId ? ` #${newSessionId}` : "";
+        console.log(`\n${colors.green}✔ 已开启全新会话${idLabel}${colors.reset}\n`);
     }
 
     /** 处理 /image 视图指令，支持指定本地路径或自动抓取剪贴板截图 */

@@ -1,5 +1,6 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ContextRecord } from "./context/types";
+import type { RequestDiagnostics } from "./runtime/model-adapter";
 
 export type StepType = 
 "thought" | 
@@ -51,6 +52,7 @@ export interface GenerationUsage {
 }
 
 export interface GenerationCall {
+    diagnostics?: RequestDiagnostics;
     phase?: "streaming" | "finished";
     callNo: number;
     maxTokens: number;
@@ -80,6 +82,7 @@ export interface GenerationAttempt {
 }
 
 export interface ExecutionRecord {
+    auxiliaryRequests?: RequestDiagnostics[];
     context?: ContextRecord;
     phase?: "running" | "recovering" | "finished";
     effectiveCallRefs?: Array<{ attemptNo: number; callNo: number }>;
@@ -87,6 +90,7 @@ export interface ExecutionRecord {
     status: RunStatus;
     error?: string;
     config: {
+        diagnostics?: RequestDiagnostics;
         model: string;
         requestedReasoningEffort: string;
         thinking: "enabled" | "disabled" | "sdk-default";

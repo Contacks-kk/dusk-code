@@ -154,9 +154,11 @@ export class TurnHistoryManager {
         return this.turns.get(turnNo);
     }
 
-    /** 清空历史记录 */
+    /** 清空历史记录与屏幕行偏移状态 */
     public reset(): void {
         this.turns.clear();
+        this.totalOutputLines = 0;
+        this.turnLineOffsets.clear();
     }
 }
 

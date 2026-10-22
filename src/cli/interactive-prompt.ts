@@ -32,6 +32,7 @@ export interface SelectItem<T> {
 }
 
 export interface PromptContext {
+    reasoningDisplay?: string;
     modelName: string;
     reasoningEffort: string;
     projectPath: string;
@@ -261,7 +262,7 @@ export async function interactivePrompt(
 
             // 4. Line 4: 状态信息条（缩进 2 空格，模型 思考等级 · 路径）
             process.stdout.write(
-                `  ${FG_STATUS_MODEL}${context.modelName}${reset} ${FG_STATUS_EFFORT}${reasoningLabel(context.modelName, context.reasoningEffort)}${reset} ${FG_STATUS_DOT}·${reset} ${FG_STATUS_PATH}${context.projectPath}${reset}\n`
+                `  ${FG_STATUS_MODEL}${context.modelName}${reset} ${FG_STATUS_EFFORT}${context.reasoningDisplay ?? reasoningLabel(context.modelName, context.reasoningEffort)}${reset} ${FG_STATUS_DOT}·${reset} ${FG_STATUS_PATH}${context.projectPath}${reset}\n`
             );
 
             // 5. Line 5+: 若有斜杠命令候选，顺延展示在状态栏下方

@@ -4,13 +4,15 @@ import type { Model, ToolResultMessage } from "@mariozechner/pi-ai";
 import { boundedText } from "./recall.tool";
 import { contextEntries, applyContextArtifacts, validateToolPairs } from "./view";
 import { messageTokens, requestTokens } from "./token";
-import { summarizeContext, SUMMARY_VERSION } from "./summarizer";
+import { summarizeContext, SUMMARY_VERSION, type SummaryRepairFeedback } from "./summarizer";
+import type { ResolvedModelCapabilities } from "../runtime/model-profile";
 import { contextHash, contextNotice, type ContextArtifact, type ContextEntry, type ContextEvent, type ContextMessage,
     type ContextPersistence, type ContextRecord, type ContextSummary } from "./types";
 
 const calibration = new Map<string, number>();
 
 export interface ContextCoordinatorOptions {
+    capabilities?: ResolvedModelCapabilities;
     model: Model<any>;
     apiKey: string;
     systemPrompt: string;
@@ -225,6 +227,7 @@ export class ContextCoordinator {
                 this.options.onStatus?.("正在压缩历史上下文，原始记录保持归档。");
 
                 // 调用LLM生成历史总结，两次重试机会
+                let feedback: SummaryRepairFeedback | undefined;
                 for (let attempt = 0; attempt < 2; attempt++) {
                     const started = Date.now();
                     try {
@@ -232,7 +235,7 @@ export class ContextCoordinator {
                         // 向终端UI推送显示正在压缩
                         const sources = await this.summarySources(selected);
                         const result = await (this.options.summarize ?? summarizeContext)(this.options.model, this.options.apiKey, sources, signal,
-                            attempt > 0, selected.flatMap(entry => entry.sources.map(source => source.ref)));
+                            attempt > 0, selected.flatMap(entry => entry.sources.map(source => source.ref)), this.options.capabilities, feedback);
                         signal?.throwIfAborted();
 
                         // 将选中的内容交给LLM，配promt生成摘要，封装压缩产物
@@ -242,19 +245,32 @@ export class ContextCoordinator {
 
                         // 效果检查，摘要必须比原文小
                         if (artifact.afterTokens >= artifact.beforeTokens) {
-                            throw Object.assign(new Error("摘要没有释放上下文空间"), { contextRepairable: true });
+                            throw Object.assign(new Error("摘要没有释放上下文空间"), {
+                                contextRepairable: true,
+                                contextUsage: result.usage,
+                                contextDiagnostics: { ...result.diagnostics, failure: "not_smaller" }
+                            });
                         }
                         this.install(artifact, signal);
                         summaryFailed = false;
                         freshSummaryId = artifact.id;
-                        Object.assign(this.record.events.at(-1)!, { usage: result.usage, durationMs: Date.now() - started });
+                        Object.assign(this.record.events.at(-1)!, { usage: result.usage, durationMs: Date.now() - started, diagnostics: result.diagnostics });
                         break;
                     } catch (error) {
                         signal?.throwIfAborted();
                         summaryFailed = true;
+                        const diagnostics = (error as any)?.contextDiagnostics;
+                        const reason = error instanceof Error ? error.message : String(error);
+                        feedback = {
+                            reason,
+                            textChars: diagnostics?.textChars,
+                            estimatedTextTokens: diagnostics?.estimatedTextTokens
+                        };
+                        this.options.onStatus?.(`摘要第 ${attempt + 1} 次失败：${reason}${(error as any)?.contextRepairable && attempt === 0 ? "；将携带原因修复一次。" : "；转入上下文裁剪。"}`);
                         this.event({ kind: "summary_failed", beforeTokens: before, afterTokens: before, durationMs: Date.now() - started,
                             usage: (error as any)?.contextUsage,
-                            error: error instanceof Error ? error.message : String(error) });
+                            diagnostics,
+                            error: reason });
                         if (!(error as any)?.contextRepairable) break;
                     }
                 }

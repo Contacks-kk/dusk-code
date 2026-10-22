@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { GenerationUsage } from "../types";
+import type { RequestDiagnostics } from "../runtime/model-adapter";
 
 export interface ContextSource {
     ref: string;
@@ -58,6 +59,7 @@ export interface ContextArtifact {
 }
 
 export interface ContextEvent {
+    diagnostics?: RequestDiagnostics;
     kind: "summary" | "excerpt" | "omission" | "summary_failed" | "storage_failed" | "provider_overflow";
     beforeTokens: number;
     afterTokens: number;

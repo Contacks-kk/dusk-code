@@ -1,13 +1,14 @@
 import { Agent, type AgentMessage, type AgentTool, type StreamFn } from "@mariozechner/pi-agent-core";
-import { createAssistantMessageEventStream, streamSimple, type AssistantMessage, type ImageContent, type Model } from "@mariozechner/pi-ai";
+import { createAssistantMessageEventStream, streamSimple, type AssistantMessage, type ImageContent } from "@mariozechner/pi-ai";
 import type { AgentExecutionStep, ExecutionRecord, GenerationAttempt, GenerationCall, GenerationUsage, RunStatus } from "./types";
 import { toolRegistry } from "./tools/registry";
 import { permissionManager, READ_TOOLS } from "./runtime/permission-manager";
-import { generationPolicy, isMiMoModel, type GenerationPolicy, type ReasoningEffort } from "./runtime/generation-policy";
+import { generationPolicy, type GenerationPolicy, type ReasoningEffort } from "./runtime/generation-policy";
 import { ContextCoordinator } from "./context/coordinator";
 import { sourceMessage, type ContextMessage, type ContextPersistence } from "./context/types";
 import { historyToolId, restoreRecordedMessages } from "./context/history";
-import { prepareModelRequest } from "./runtime/model-adapter";
+import { finishRequestDiagnostics, prepareModelRequest, type RequestDiagnostics } from "./runtime/model-adapter";
+import { resolveModelCapabilities, sdkModel, type ResolvedModelCapabilities } from "./runtime/model-profile";
 import { salvageResponse, composeReply, composeIncompleteReport, type ResponseQuality, type SalvagedContent } from "./runtime/response-salvager";
 import {
     detectTruncationStage,
@@ -16,11 +17,13 @@ import {
 } from "./runtime/truncation-recovery";
 
 export interface RunnerOptions extends Partial<GenerationPolicy> {
+    auxiliaryRequests?: RequestDiagnostics[];
     baseUrl: string;
     model: string;
     apiKey: string;
     reasoningEffort?: ReasoningEffort;
     contextWindow?: number;
+    capabilities?: ResolvedModelCapabilities;
     compactionEnabled?: boolean;
     contextPersistence?: ContextPersistence;
     currentTurnId?: number;
@@ -70,6 +73,7 @@ export class AgentRunner {
     private readonly tools: AgentTool<any>[];
     private readonly systemPrompt: string;
     private readonly contextWindow: number;
+    private readonly capabilities: ResolvedModelCapabilities;
     private readonly steps: AgentExecutionStep[] = [];
     private persistenceError?: string;
     private originalUser?: AgentMessage;
@@ -80,7 +84,13 @@ export class AgentRunner {
         this.policy = generationPolicy(options, options.model);
         this.tools = options.tools ?? toolRegistry.getAll();
         this.systemPrompt = options.systemPrompt ?? "你是一个具备工具调用能力的专业 AI 助手，在需要时自主使用工具解决问题。";
-        this.contextWindow = options.contextWindow ?? 128000;
+        this.capabilities = options.capabilities ?? resolveModelCapabilities({
+            model: options.model,
+            baseUrl: options.baseUrl,
+            windowTokens: options.contextWindow,
+            windowExplicit: options.contextWindow !== undefined
+        });
+        this.contextWindow = this.capabilities.contextWindow;
     }
 
     /**
@@ -154,27 +164,10 @@ export class AgentRunner {
                 return tool.execute(...args);
             }
         }));
-        const model: Model<"openai-completions"> = {
-            id: this.options.model,
-            name: this.options.model,
-            api: "openai-completions",
-            provider: "openai",
-            baseUrl: this.options.baseUrl.replace(/\/+$/, "").replace(/\/(?:chat\/completions|responses)$/i, ""),
-            reasoning: effort !== "off", input: ["text", "image"],
-            cost: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0
-            },
-            contextWindow: this.contextWindow,
-            maxTokens: summary.maxTokens,
-            headers: {
-                Authorization: `Bearer ${this.options.apiKey}`
-            }
-        };
+        const model = sdkModel(this.capabilities);
         this.contextCoordinator ??= new ContextCoordinator({
             model,
+            capabilities: this.capabilities,
             apiKey: this.options.apiKey,
             systemPrompt: this.systemPrompt,
             tools: this.tools,
@@ -228,6 +221,9 @@ export class AgentRunner {
                 if (call.response.errorMessage) {
                     call.response.errorMessage = this.safeError(call.response.errorMessage);
                 }
+                if (call.diagnostics) {
+                    finishRequestDiagnostics(call.diagnostics, message, callStart || Date.now());
+                }
                 call.stopReason = message.stopReason;
                 call.usage = usageOf(message);
                 call.hasText = Boolean(textOf(message));
@@ -275,7 +271,7 @@ export class AgentRunner {
                     this.annotateCurrent(context.messages, summary);
 
                     // 判断是否需要进行压缩，需要时则阻塞压缩，并向UI推送“正在压缩的消息
-                    let fitted = await this.contextCoordinator.prepare(context.messages, summary.maxTokens, controller.signal);
+                    let fitted = await this.contextCoordinator.prepare(context.messages, Math.min(summary.maxTokens, this.capabilities.maxOutputTokens ?? summary.maxTokens), controller.signal);
 
                     controller.signal.throwIfAborted();
                     onCallCompleted();
@@ -283,17 +279,20 @@ export class AgentRunner {
                     callStart = lastTokenTime = Date.now();
                     if (this.policy.generationTimeoutMs) timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.policy.generationTimeoutMs);
                     for (let overflowRetry = 0; overflowRetry < 2; overflowRetry++) {
-                        const request = prepareModelRequest({ ...context, messages: fitted }, callModel, effort, options.onPayload);
-                        const source = streamSimple(
-                            callModel,
-                            request.context, {
-                            ...options,
-                            signal: controller.signal,
-                            maxTokens: summary.maxTokens,
-                            maxRetries: 0,
-                            timeoutMs: this.policy.generationTimeoutMs && this.policy.generationTimeoutMs > 0 ? this.policy.generationTimeoutMs : undefined,
-                            onPayload: request.onPayload
-                        });
+                        const request = prepareModelRequest({ ...context, messages: fitted }, this.capabilities,
+                            summary.attemptNo === 1 ? "task" : "recovery", effort, summary.maxTokens, {
+                                ...options,
+                                apiKey: this.options.apiKey,
+                                signal: controller.signal,
+                                maxRetries: 0,
+                                timeoutMs: this.policy.generationTimeoutMs
+                            });
+                        call.diagnostics = request.diagnostics;
+                        call.maxTokens = request.diagnostics.maxTokens;
+                        if (request.diagnostics.downgrade) {
+                            this.emit({ type: "status", content: request.diagnostics.downgrade });
+                        }
+                        const source = streamSimple(request.model, request.context, request.options);
                         let overflow = false;
                         let pendingStart: { type: "start"; partial: AssistantMessage } | undefined;
                         for await (const event of source) {
@@ -335,7 +334,7 @@ export class AgentRunner {
                         if (!overflow) break;
 
                         // 判断是否需要进行压缩，需要时则阻塞压缩，并向UI推送“正在压缩的消息
-                        fitted = await this.contextCoordinator.prepare(context.messages, summary.maxTokens, controller.signal, true);
+                        fitted = await this.contextCoordinator.prepare(context.messages, call.maxTokens, controller.signal, true);
                         onCallCompleted();
                     }
                 } catch (error) {
@@ -543,7 +542,7 @@ export class AgentRunner {
 
 
 
-    
+
     /** 编排保留本轮进展的截断恢复并保存执行检查点 */
     public async run(prompt: string, images?: ImageContent[]): Promise<RunnerOutput> {
         const started = Date.now();
@@ -554,13 +553,17 @@ export class AgentRunner {
             role: "user", timestamp: started,
             content: images?.length ? [{ type: "text", text: prompt }, ...images] : prompt
         };
+        const initialRequest = prepareModelRequest({ messages: [] }, this.capabilities, "task",
+            this.options.reasoningEffort ?? "high", this.policy.maxTokens).diagnostics;
         const execution: ExecutionRecord = {
+            auxiliaryRequests: this.options.auxiliaryRequests,
             phase: "running", status: "failed", effectiveCallRefs: [], pendingToolCallIds: [],
             config: {
                 ...this.policy, model: this.options.model,
                 requestedReasoningEffort: this.options.reasoningEffort ?? "high",
                 contextWindow: this.contextWindow,
-                thinking: isMiMoModel(this.options.model) ? (this.options.reasoningEffort === "off" ? "disabled" : "enabled") : "sdk-default"
+                thinking: initialRequest.effectiveThinking === "sdk-default" ? "sdk-default" : initialRequest.effectiveThinking === "disabled" ? "disabled" : "enabled",
+                diagnostics: initialRequest
             },
             attempts: [], recoverySteps: [], totalDurationMs: 0
         };
@@ -611,17 +614,19 @@ export class AgentRunner {
             const history = summary.attemptNo === 1 ? this.options.initialMessages ?? [] :
                 [...this.options.initialMessages ?? [], this.originalUser, ...currentMessages()];
 
-            // 
+            // 保留本轮已结算内容并继续当前尝试
             const result = await this.attempt(activePrompt, summary.attemptNo === 1 ? images : undefined,
                 history, summary, execution, persistExecution, effort);
-            
+
             messages = result.messages;
             latestSalvaged = result.salvaged;
             if (latestSalvaged.text) {
                 if (continuation) chunks.push(latestSalvaged.text);
                 else chunks = [latestSalvaged.text];
             }
-            if (this.persistenceError) { contextError = this.persistenceError; break; }
+            if (this.persistenceError) {
+                contextError = this.persistenceError; break;
+            }
             try { persistExecution(); }
             catch { contextError = this.persistenceError; break; }
 
@@ -658,7 +663,7 @@ export class AgentRunner {
             const stageName = stage === "tool_call" ? "工具参数" : stage === "text" ? "正文" : "思考";
             this.emit({
                 type: "status", attemptNo: summary.attemptNo,
-                content: stageName + "达到单次输出上限，保留本轮进展并请求关闭思考继续（" +
+                content: stageName + "达到单次输出上限，保留本轮进展并按辅助请求思考策略继续（" +
                     (recoveryCount + 1) + "/" + maxRecoveryAttempts + "，预算 " + maxTokens + " token）。"
             });
         }
@@ -674,7 +679,8 @@ export class AgentRunner {
         if (this.options.signal?.aborted && !this.persistenceError && last) last.status = "aborted";
         if (last?.error && !execution.error) execution.error = last.error;
         if (!this.persistenceError) {
-            try { persistExecution(); } catch { /* 下方统一返回持久化失败。 */ }
+            try { persistExecution(); }
+            catch { /* 下方统一返回持久化失败。 */ }
         }
         execution.totalDurationMs = Date.now() - started;
         execution.status = this.persistenceError ? "failed" : last?.status ?? "failed";

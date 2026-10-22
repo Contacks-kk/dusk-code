@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import { agentService } from "./services/agent.service";
 import { projectService } from "./services/project.service";
+import { sessionService } from "./services/session.service";
 import { permissionManager } from "./agent/runtime/permission-manager";
 import { modelConfigManager } from "./agent/runtime/model-config";
 import { commandHandler } from "./cli/command-handler";
@@ -8,6 +9,9 @@ import { colors, printHeaderBanner, renderLiveStep, renderAssistantReply, render
 import { interactivePrompt, interactiveSelect } from "./cli/interactive-prompt";
 import { extractImagePaths } from "./utils/image";
 import { mouseTracker } from "./cli/mouse-tracker";
+import { liveInputManager } from "./cli/live-input";
+import { isPlanConfirmationPrompt, promptPlanConfirmation } from "./cli/plan-confirmation";
+import type { AgentRunResult } from "./agent/types";
 
 /** 检测异常是否为 Ctrl+C 中断引发的取消错误 */
 function isAbortError(err: unknown): boolean {
@@ -43,6 +47,10 @@ async function startCli(): Promise<void> {
     // 1. 初始化并绑定当前工程上下文
     const currentProject = await projectService.getOrCreateProject(process.cwd());
 
+    // 默认创建当前工程下的全新会话
+    const initialSession = await sessionService.createSession("新对话", currentProject.id);
+    currentSessionId = initialSession.id;
+
     // 2. 打印品牌 Banner 与工程看板
     const initialModelCfg = modelConfigManager.getModelConfig();
     printHeaderBanner({
@@ -51,8 +59,12 @@ async function startCli(): Promise<void> {
         sessionId: currentSessionId,
         permissionMode: permissionManager.getMode(),
         modelName: initialModelCfg.model,
-        reasoningEffort: initialModelCfg.reasoningEffort
+        reasoningEffort: initialModelCfg.reasoningEffort,
+        reasoningDisplay: modelConfigManager.getDisplayLabel().effort
     });
+    for (const warning of initialModelCfg.capabilities.warnings) {
+        console.log(`${colors.yellow}${warning}${colors.reset}`);
+    }
 
     /** 越界或高危操作通过交互式上下键进行提权确认 */
     const askUserPermission = async (promptText: string): Promise<boolean> => {
@@ -67,15 +79,63 @@ async function startCli(): Promise<void> {
         return confirmed === true;
     };
 
-    /** 为所有 CLI 对话入口绑定统一取消控制器 */
+    /** 为所有 CLI 对话入口绑定统一取消控制器并开放执行态输入框 */
     const chat = async (prompt: string, imagePaths?: string[]) => {
         activeController = new AbortController();
+
+        // 开放执行期输入框供用户键入
+        liveInputManager.start();
+
         try {
+            // 调用 AgentService 执行对话链路
             return await agentService.chat(currentSessionId, prompt, {
-                projectId: currentProject.id, imagePaths, signal: activeController.signal,
-                onStep: renderLiveStep, onAskPermission: askUserPermission
+                projectId: currentProject.id,
+                imagePaths,
+                signal: activeController.signal,
+                onStep: renderLiveStep,
+                onAskPermission: askUserPermission
             });
-        } finally { activeController = undefined; }
+        } finally {
+            // 关闭执行期输入框并清理状态
+            liveInputManager.stop();
+            activeController = undefined;
+        }
+    };
+
+    /** 统一渲染每轮 Assistant 结果、耗时结算并处理方案确认弹窗流转 */
+    const handleTurnCompletion = async (
+        result: AgentRunResult,
+        turnDurationMs: number,
+        isExplicitPlan = false
+    ): Promise<void> => {
+        currentSessionId = result.sessionId;
+
+        // 1. 渲染最终回复（原生 Markdown 终端美化）
+        renderAssistantReply(result.reply, result.status);
+
+        // 2. 结算全链路耗时
+        renderCrunchedSummary(turnDurationMs);
+
+        // 3. 检查是否为 Agent 制定的方案并等待用户确认
+        if (isPlanConfirmationPrompt(result.reply, isExplicitPlan)) {
+            const confirmation = await promptPlanConfirmation();
+            if (confirmation.action === "confirm") {
+                const followUpPrompt = "确认执行该修改，请立即调用相关工具落地方案。";
+                const followUpStart = Date.now();
+                const followUpResult = await chat(followUpPrompt);
+                const followUpDuration = Date.now() - followUpStart;
+
+                // 递归流转执行后续阶段
+                await handleTurnCompletion(followUpResult, followUpDuration, false);
+            } else if (confirmation.action === "supplement" && confirmation.supplementText) {
+                const followUpStart = Date.now();
+                const followUpResult = await chat(confirmation.supplementText);
+                const followUpDuration = Date.now() - followUpStart;
+
+                // 递归流转执行补充方案
+                await handleTurnCompletion(followUpResult, followUpDuration, false);
+            }
+        }
     };
 
     try {
@@ -86,6 +146,7 @@ async function startCli(): Promise<void> {
             const userInput = await interactivePrompt({
                 modelName: currentModelCfg.model,
                 reasoningEffort: currentModelCfg.reasoningEffort,
+                reasoningDisplay: modelConfigManager.getDisplayLabel().effort,
                 projectPath: currentProject.rootPath,
                 placeholder: "How can I help you?"
             });
@@ -113,15 +174,13 @@ async function startCli(): Promise<void> {
                     }
                     printImageAttachmentBadge(imgData.imagePaths);
 
-                    // 3.1 调用agent进行chat
+                    // 3.1 记录起始时间并调用 agent 执行对话
+                    const turnStart = Date.now();
                     const result = await chat(imgData.prompt, imgData.imagePaths);
-                    currentSessionId = result.sessionId;
+                    const turnDuration = Date.now() - turnStart;
 
-                    // 3.2 渲染包含原生 Markdown
-                    renderAssistantReply(result.reply, result.status);
-                    if (result.totalDurationMs) {
-                        renderCrunchedSummary(result.totalDurationMs);
-                    }
+                    // 3.2 渲染回复、耗时并处理方案确认
+                    await handleTurnCompletion(result, turnDuration, false);
                     continue;
                 }
 
@@ -149,8 +208,11 @@ async function startCli(): Promise<void> {
                 }
 
                 if (cmd === "/new") {
-                    commandHandler.handleNew();
-                    currentSessionId = undefined;
+                    // 创建当前工程下新的独立会话
+                    const newSession = await sessionService.createSession("新对话", currentProject.id);
+                    currentSessionId = newSession.id;
+
+                    commandHandler.handleNew(newSession.id);
                     continue;
                 }
 
@@ -174,13 +236,14 @@ async function startCli(): Promise<void> {
                     const planPrompt = `【PLANNING 规划模式】请针对以下任务进行深入分析与调研规划。在此模式下，请仅使用只读工具（如 list_files, read_file, grep_search, git_status 等）查阅代码，切勿执行任何写操作或修改代码。请输出一份条理清晰、步骤明确的完整技术实施方案：\n\n${cmdArg}`;
 
                     console.log(`\n${colors.bold}● Plan: ${cmdArg}${colors.reset}\n`);
-                    const result = await chat(planPrompt);
-                    currentSessionId = result.sessionId;
 
-                    renderAssistantReply(result.reply, result.status);
-                    if (result.totalDurationMs) {
-                        renderCrunchedSummary(result.totalDurationMs);
-                    }
+                    // 记录起始时间并执行规划模式
+                    const turnStart = Date.now();
+                    const result = await chat(planPrompt);
+                    const turnDuration = Date.now() - turnStart;
+
+                    // 渲染方案回复并自动弹出确认弹窗
+                    await handleTurnCompletion(result, turnDuration, true);
                     continue;
                 }
 
@@ -208,14 +271,13 @@ async function startCli(): Promise<void> {
                 }
             }
 
+            // 记录用户输入提交起始时间
+            const turnStart = Date.now();
             const result = await chat(activePrompt, attachedImages.length > 0 ? attachedImages : undefined);
-            currentSessionId = result.sessionId;
+            const turnDuration = Date.now() - turnStart;
 
-            // 渲染最终回复（原生 Markdown 终端美化与耗时结算）
-            renderAssistantReply(result.reply, result.status);
-            if (result.totalDurationMs) {
-                renderCrunchedSummary(result.totalDurationMs);
-            }
+            // 渲染最终回复、结算耗时并处理方案确认流转
+            await handleTurnCompletion(result, turnDuration, false);
         }
     } catch (err) {
         if (!isAbortError(err)) {

@@ -27,7 +27,6 @@ export function generationPolicy(input: Partial<GenerationPolicy> = {}, model = 
         throw new Error("generationTimeoutMs 必须为正整数");
     }
     if (policy.retryMaxTokens < policy.maxTokens) throw new Error("retryMaxTokens 不得小于 maxTokens");
-    if (isMiMoModel(model) && policy.retryMaxTokens > 131072) throw new Error("MiMo 输出预算不得超过 131072");
     return policy;
 }
 
