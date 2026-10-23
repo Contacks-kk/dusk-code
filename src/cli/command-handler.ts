@@ -23,6 +23,13 @@ import { supportedEfforts } from "../agent/runtime/model-profile";
 import { turnInspector } from "./turn-inspector";
 import { turnHistoryManager } from "./turn-history";
 import { skillRegistry } from "../agent/skills/registry";
+import { skillActivator } from "../agent/skills/activator";
+import { changeSkillState, normalizeSkillState, hasSkillNotice } from "../agent/skills/state";
+import type { SessionSkillState, SkillItem } from "../agent/skills/types";
+
+type SkillAction = "pin" | "off" | "view";
+type SkillChoice = { name: string; action: SkillAction };
+type SkillCommand = { action: "clear" | "browse" } | { action: "pin" | "off"; name: string };
 
 export class CommandHandler {
     /** 展示恢复会话上一轮的执行结果 */
@@ -51,6 +58,7 @@ export class CommandHandler {
         for (const item of history) {
             const turnNo = item.turn.turnNo;
             turnHistoryManager.recordTurnStart(turnNo);
+            turnHistoryManager.recordExecution(turnNo, item.turn.executionJson);
 
             // 1. 提取并渲染用户提问内容与附加图片
             const userMsg = item.messages.find((m) => m.role === "user");
@@ -138,6 +146,10 @@ export class CommandHandler {
             const assistantMsg = item.messages.find((m) => m.role === "assistant");
             if (assistantMsg) {
                 renderAssistantReply(assistantMsg.content, item.turn.executionJson?.status);
+            }
+            const skillRecord = item.turn.executionJson?.skills;
+            if (skillRecord && hasSkillNotice(skillRecord)) {
+                console.log(`技能运行存在降级或未验收项：${skillRecord.selection.error ?? ""} ${skillRecord.visual.reason ?? ""}；/turn ${turnNo} 可查看完整记录。`);
             }
 
             // 4. 渲染耗时总结与标记轮次结束
@@ -399,77 +411,115 @@ export class CommandHandler {
         await turnInspector.open(turnNo);
     }
 
-    /** 交互式查看可用技能或激活指定专属技能 */
-    public async handleSkill(arg?: string): Promise<void> {
-        const skillName = arg?.trim();
+    /** 展示技能的实际来源、目录和会话设置 */
+    private showSkill(skill: SkillItem, state: SessionSkillState): void {
+        const key = skill.name.toLowerCase();
+        const status = state.disabled.includes(key) ? "会话已关闭" : state.pinned.includes(key) ? "会话已固定，下轮加载正文" : "可用，尚未手动激活";
+        console.log(`\n${colors.cyan}● ${skill.name} [${skill.source}] ${status}${colors.reset}`);
+        console.log(`描述：${skill.description}\n根目录：${skill.skillDir}\n正文：${skill.skillMdPath}`);
+        for (const reference of skill.references) {
+            console.log(`参考资料：${reference.absolutePath}`);
+        }
+        for (const script of skill.scripts) {
+            console.log(`脚本：${path.resolve(skill.skillDir, "scripts", script)}`);
+        }
+    }
 
-        if (skillName) {
-            // 根据用户传入的技能名直接查询
-            const skill = await skillRegistry.get(skillName);
-
-            if (!skill) {
-                console.log(`\n${colors.yellow}未找到技能 "${skillName}"。输入 /skill 可查看所有可用技能列表。${colors.reset}\n`);
-                return;
-            }
-
-            console.log(`\n${colors.cyan}${colors.bold}● 专属技能: ${skill.name}${colors.reset} [来源: ${skill.source}]`);
-            console.log(`${colors.gray}描述: ${skill.description}${colors.reset}`);
-            console.log(`${colors.gray}路径: ${skill.path}${colors.reset}`);
-
-            if (skill.references.length > 0) {
-                console.log(`${colors.gray}配套参考文档:${colors.reset}`);
-                for (const ref of skill.references) {
-                    console.log(`  - ${ref.name}`);
-                }
-            }
-
-            console.log(`\n${colors.green}✔ 提示：该技能已装配在 Code Agent 提示词索引中，Agent 在相关任务中会自动调用 activate_skill。${colors.reset}\n`);
+    /** 查看、启用或关闭当前会话的技能 */
+    public async handleSkill(arg: string | undefined, sessionId: number): Promise<void> {
+        const current = await sessionService.getSessionById(sessionId);
+        if (!current) {
+            throw new Error("当前会话不存在");
+        }
+        const project = current.projectId ? await projectService.getProjectById(current.projectId) : undefined;
+        await skillRegistry.reload(project?.rootPath ?? process.cwd());
+        const state = normalizeSkillState(current.skillStateJson);
+        const command = this.parseSkillCommand(arg);
+        if (command.action === "clear") {
+            await sessionService.saveSkillState(sessionId, changeSkillState(state, "clear"));
+            console.log("\n已清除手动技能和禁用名单，当前会话恢复自动选择。\n");
             return;
         }
+        if (command.action === "off") {
+            await sessionService.saveSkillState(sessionId, changeSkillState(state, "off", command.name));
+            console.log(`\n已关闭 ${command.name}，本会话不会自动重新选中。\n`);
+            return;
+        }
+        const choice = command.action === "browse" ? await this.chooseSkill(state) : command;
+        if (choice && "name" in choice) {
+            await this.applySkillChoice(choice, state, sessionId);
+        }
+    }
 
-        // 获取全部已注册技能
+    /** 解析技能命令，保留直接关闭和清空设置的既有语义 */
+    private parseSkillCommand(arg?: string): SkillCommand {
+        const input = arg?.trim() ?? "";
+        if (input.toLowerCase() === "clear") {
+            return { action: "clear" };
+        }
+        const off = /^off\s+(.+)$/i.exec(input);
+        if (off) {
+            return { action: "off", name: off[1] };
+        }
+        return input ? { action: "pin", name: input } : { action: "browse" };
+    }
+
+    /** 交互式选择技能及启用、关闭或查看操作 */
+    private async chooseSkill(state: SessionSkillState): Promise<SkillChoice | undefined> {
         const skills = await skillRegistry.getAll();
+        console.log(`\n会话固定：${state.pinned.join("、") || "无"}；会话关闭：${state.disabled.join("、") || "无"}。`);
+        if (!skills.length) {
+            console.log("未发现可用技能。仅扫描内置目录、用户 ~/.dusk/skills 和项目 .dusk/skills，下载到其他目录不会自动加载。\n");
+            return undefined;
+        }
+        const items: SelectItem<string>[] = skills.map(skill => ({
+            label: `${skill.name} [${skill.source}] ${state.pinned.includes(skill.name.toLowerCase()) ? "已固定" : state.disabled.includes(skill.name.toLowerCase()) ? "已关闭" : "自动"}`,
+            value: skill.name,
+            hint: skill.description.slice(0, 70)
+        }));
+        const name = await interactiveSelect(items, "选择技能");
+        if (!name) {
+            return undefined;
+        }
+        const action = await interactiveSelect<SkillAction>([
+            { label: "启用并固定到当前会话", value: "pin" },
+            { label: "关闭且禁止自动选择", value: "off" },
+            { label: "仅查看来源和目录", value: "view" }
+        ], "选择操作") ?? "view";
+        return { name, action };
+    }
 
-        if (skills.length === 0) {
-            console.log(`\n${colors.yellow}当前未加载到任何可用技能。请检查 skills/ 或 .dusk/skills/ 目录。${colors.reset}\n`);
+    /** 执行技能查看或在校验通过后保存会话设置 */
+    private async applySkillChoice(choice: SkillChoice, state: SessionSkillState, sessionId: number): Promise<void> {
+        const skill = await skillRegistry.get(choice.name);
+        if (!skill) {
+            console.log(`\n未发现技能 ${choice.name}。输入 /skill 查看实际扫描到的技能。\n`);
+            return;
+        }
+        if (choice.action === "view") {
+            this.showSkill(skill, state);
+            return;
+        }
+        if (choice.action === "pin" && !await this.canPinSkill(skill.name)) {
             return;
         }
 
-        // 构建交互式选择菜单项
-        const items: SelectItem<string>[] = skills.map((s) => {
-            return {
-                label: `${s.name} [${s.source}]`,
-                value: s.name,
-                hint: s.description.length > 40 ? s.description.slice(0, 37) + "..." : s.description
-            };
-        });
+        // 正文校验通过后才保存会话设置，新会话不会继承
+        const next = changeSkillState(state, choice.action, skill.name);
+        await sessionService.saveSkillState(sessionId, next);
+        this.showSkill(skill, next);
+        console.log(choice.action === "pin" ? "正文读取校验成功，后续轮次持续加载；/skill off <name> 可关闭。\n" : "本会话已关闭，自动选择将跳过该技能。\n");
+    }
 
-        // 交互式上下键选择技能
-        const selectedName = await interactiveSelect(items, "请选择要查看或激活的专属技能");
-
-        if (!selectedName) {
-            return;
+    /** 确认正文可读且非空，失败时保留原有会话设置 */
+    private async canPinSkill(name: string): Promise<boolean> {
+        const result = await skillActivator.activate(name);
+        if (result.success === false || !result.content.trim()) {
+            const error = result.success === false ? result.error : "技能正文为空";
+            console.log(`\n激活失败：${error}；未改变会话设置。\n`);
+            return false;
         }
-
-        // 获取选中的技能并展示其元数据与参考资料
-        const selectedSkill = await skillRegistry.get(selectedName);
-
-        if (!selectedSkill) {
-            return;
-        }
-
-        console.log(`\n${colors.cyan}${colors.bold}● 专属技能: ${selectedSkill.name}${colors.reset} [来源: ${selectedSkill.source}]`);
-        console.log(`${colors.gray}描述: ${selectedSkill.description}${colors.reset}`);
-        console.log(`${colors.gray}路径: ${selectedSkill.path}${colors.reset}`);
-
-        if (selectedSkill.references.length > 0) {
-            console.log(`${colors.gray}配套参考文档:${colors.reset}`);
-            for (const ref of selectedSkill.references) {
-                console.log(`  - ${ref.name}`);
-            }
-        }
-
-        console.log(`\n${colors.green}✔ 提示：该技能已装配在 Code Agent 提示词索引中，Agent 在相关任务中会自动调用 activate_skill。${colors.reset}\n`);
+        return true;
     }
 }
 

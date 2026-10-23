@@ -1,6 +1,7 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 import { skillActivator } from "../../skills/activator";
+import type { SkillRuntime } from "../../skills/runtime";
 
 const activateSkillParams = Type.Object({
     skillName: Type.String({
@@ -19,7 +20,7 @@ export const activateSkillTool: AgentTool<typeof activateSkillParams> = {
         // 调用激活器载入技能正文
         const result = await skillActivator.activate(params.skillName);
 
-        if (!result.success) {
+        if (result.success === false) {
             return {
                 content: [
                     {
@@ -98,3 +99,60 @@ export const readSkillReferenceTool: AgentTool<typeof readSkillReferenceParams> 
         };
     }
 };
+
+/** 加载技能快照并将正文加入后续请求的运行时指令 */
+async function activateRuntimeSkill(runtime: SkillRuntime, skillName: string, signal?: AbortSignal): Promise<AgentToolResult<unknown>> {
+    signal?.throwIfAborted();
+    try {
+        const snapshot = await runtime.load(skillName, "tool", "主模型在执行阶段补充");
+        signal?.throwIfAborted();
+        return {
+            content: [{ type: "text", text: `技能 ${snapshot.name} 已加载到后续请求的当前技能指令中。根目录：${snapshot.skillDir}\n参考资料：${JSON.stringify(snapshot.references)}\n脚本：${JSON.stringify(snapshot.scripts)}` }],
+            details: {
+                skillName: snapshot.name,
+                skillDir: snapshot.skillDir,
+                source: snapshot.source,
+                hash: snapshot.hash
+            }
+        };
+    } catch (error) {
+        signal?.throwIfAborted();
+        return {
+            content: [{ type: "text", text: `技能加载失败：${String(error)}` }],
+            details: { skillName, error: String(error) }
+        };
+    }
+}
+
+/** 读取当前已激活技能登记的参考资料并保存读取证据 */
+async function readRuntimeReference(runtime: SkillRuntime, skillName: string, referenceName: string,
+    toolCallId: string, signal?: AbortSignal): Promise<AgentToolResult<unknown>> {
+    signal?.throwIfAborted();
+    try {
+        const content = await runtime.readReference(skillName, referenceName, toolCallId);
+        signal?.throwIfAborted();
+        return {
+            content: [{ type: "text", text: content }],
+            details: { skillName, referenceName, contentLength: content.length }
+        };
+    } catch (error) {
+        signal?.throwIfAborted();
+        return {
+            content: [{ type: "text", text: `参考资料读取失败：${String(error)}` }],
+            details: { skillName, referenceName, error: String(error) }
+        };
+    }
+}
+
+/** 为本轮任务绑定有状态的技能工具，避免会话之间共享激活状态 */
+export function createSkillTools(runtime: SkillRuntime): [AgentTool<typeof activateSkillParams>, AgentTool<typeof readSkillReferenceParams>] {
+    return [{
+        ...activateSkillTool,
+        /** 执行本轮技能加载 */
+        execute: (_id, params, signal) => activateRuntimeSkill(runtime, params.skillName, signal)
+    }, {
+        ...readSkillReferenceTool,
+        /** 执行本轮参考资料读取 */
+        execute: (id, params, signal) => readRuntimeReference(runtime, params.skillName, params.referenceName, id, signal)
+    }];
+}

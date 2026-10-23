@@ -3,6 +3,7 @@ import { currentTimeTool } from "./system/time.tool";
 import { calculatorTool } from "./system/calc.tool";
 import { listFilesTool } from "./code/list-files.tool";
 import { readFileTool } from "./code/read-file.tool";
+import { readImageTool } from "./code/read-image.tool";
 import { grepSearchTool } from "./code/grep-search.tool";
 import { applyPatchTool } from "./code/apply-patch.tool";
 import { writeFileTool } from "./code/write-file.tool";
@@ -22,6 +23,7 @@ class ToolRegistry {
         // Code Agent 核心 8 大工具
         this.register(listFilesTool);
         this.register(readFileTool);
+        this.register(readImageTool);
         this.register(grepSearchTool);
         this.register(applyPatchTool);
         this.register(writeFileTool);

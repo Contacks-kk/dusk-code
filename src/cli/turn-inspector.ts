@@ -4,6 +4,7 @@ import { turnHistoryManager, type TurnRecord, type ToolCallDetail } from "./turn
 import { interactiveSelect, type SelectItem } from "./interactive-prompt";
 import { renderMarkdown } from "./markdown";
 import { mouseTracker } from "./mouse-tracker";
+import { imageArchiveReplacer } from "../utils/image";
 
 export class TurnInspector {
     /** 等待用户按任意键继续 */
@@ -91,7 +92,7 @@ ${colors.cyan}──────────────────────
         if (typeof tool.result === "string") {
             resStr = tool.result;
         } else if (tool.result !== undefined && tool.result !== null) {
-            resStr = JSON.stringify(tool.result, null, 2);
+            resStr = JSON.stringify(tool.result, imageArchiveReplacer, 2);
         } else {
             resStr = "(无返回值)";
         }
@@ -161,6 +162,14 @@ ${colors.cyan}──────────────────────
                 });
             }
 
+            if (turn.execution?.skills) {
+                items.push({
+                    label: "查看技能加载与视觉反馈",
+                    value: "skills",
+                    hint: `${turn.execution.skills.snapshots.filter(item => item.status === "loaded").length} 个已加载技能`
+                });
+            }
+
             items.push({
                 label: "🛠️ 查看工具调用集合与响应",
                 value: "tools",
@@ -195,8 +204,47 @@ ${colors.magenta}╰────────────────────
                 await this.waitForKey("按任意键收起发言说明...");
             } else if (choice === "tools") {
                 await this.inspectToolCalls(turn);
+            } else if (choice === "skills") {
+                this.showSkills(turn);
+                await this.waitForKey("按任意键返回执行详情...");
             }
         }
+    }
+
+    /** 展示技能选择、真实操作与视觉反馈证据 */
+    private showSkills(turn: TurnRecord): void {
+        const record = turn.execution?.skills;
+        if (!record) {
+            return;
+        }
+        console.log(`\n技能选择：${record.selection.status}${record.selection.error ? `；失败：${record.selection.error}` : ""}`);
+        for (const selected of record.selection.skills) {
+            console.log(`自动选择 ${selected.name}：${selected.reason}`);
+        }
+        for (const snapshot of record.snapshots) {
+            console.log(`\n${snapshot.name}：${snapshot.status === "loaded" ? "正文已加载" : "预算不足未加载"} [${snapshot.origin}/${snapshot.source}]`);
+            console.log(`来源：${snapshot.skillMdPath}\n根目录：${snapshot.skillDir}\nSHA256：${snapshot.hash}`);
+            if (snapshot.missingDependencies?.length) {
+                console.log(`未安装的引用技能：${snapshot.missingDependencies.join("、")}`);
+            }
+        }
+        for (const failure of record.failures) {
+            console.log(`加载失败 ${failure.name}：${failure.error}`);
+        }
+        const labels = {
+            not_required: "本轮未要求视觉验收",
+            pending: "视觉反馈待完成",
+            feedback_received: "模型已接收最新截图并返回正文，验收结论需核对响应",
+            incomplete: "视觉未验收"
+        };
+        console.log(`\n视觉反馈：${labels[record.visual.status]}${record.visual.reason ? `；${record.visual.reason}` : ""}`);
+        console.log("实际操作记录：");
+        for (const event of record.events) {
+            console.log(`${new Date(event.timestamp).toLocaleTimeString()} ${event.kind} ${event.success ? "成功" : "失败"} ${event.name ?? ""} ${event.path ?? ""} ${event.toolCallId ?? ""} ${event.detail ?? ""}`);
+        }
+        const diagnostics = turn.execution?.auxiliaryRequests?.filter(item => item.purpose === "skill_selection") ?? [];
+        console.log(`\n技能选择请求统计：${JSON.stringify(diagnostics, null, 2)}`);
+        console.log("正文加载及图片反馈均不直接代表整个技能工作流或界面验收通过。\n");
     }
 
     /** 打开思考与工具执行记录检查器 */

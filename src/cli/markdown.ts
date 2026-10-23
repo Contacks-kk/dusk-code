@@ -1,4 +1,5 @@
 import stringWidth from "string-width";
+import { getTerminalWidth, truncateTerminalText, wrapTerminalText } from "./terminal-layout";
 
 export const mdColors = {
     reset: "\x1b[0m",
@@ -44,15 +45,30 @@ function renderTable(tableLines: string[]): string {
         return trimmed.split("|").map((c) => c.trim());
     });
 
-    if (rawRows.length === 0) return "";
+    if (rawRows.length === 0) {
+        return "";
+    }
 
+    /** 识别表头下方的分隔行 */
     const isDivider = (row: string[]) => row.length > 0 && row.every((cell) => /^:?-+:?$/.test(cell.trim()));
     const dividerIndex = rawRows.findIndex(isDivider);
     const dataRows = rawRows.filter((_, idx) => idx !== dividerIndex);
 
-    if (dataRows.length === 0) return "";
+    if (dataRows.length === 0) {
+        return "";
+    }
 
     const colCount = Math.max(...dataRows.map((r) => r.length));
+    const availableWidth = getTerminalWidth() - (3 * colCount + 3);
+
+    // 极窄窗口逐项展示，避免边框挤占正文空间
+    if (availableWidth < colCount * 4) {
+        const headers = dividerIndex === -1 ? [] : dataRows[0];
+        return dataRows.slice(headers.length ? 1 : 0).map(row => row.map((cell, index) => {
+            const label = headers[index] ? `${headers[index]}: ` : "";
+            return wrapTerminalText(formatInline(`${label}${cell}`)).join("\n");
+        }).join("\n")).join("\n\n");
+    }
 
     // 计算每列最大显示宽度（支持汉字等全角字符）
     const colWidths: number[] = [];
@@ -66,6 +82,14 @@ function renderTable(tableLines: string[]): string {
         colWidths[c] = maxW;
     }
 
+    // 优先压缩较宽的列，为每个单元格保留可读空间
+    let totalWidth = colWidths.reduce((sum, width) => sum + width, 0);
+    while (totalWidth > availableWidth) {
+        const widest = colWidths.indexOf(Math.max(...colWidths));
+        colWidths[widest]--;
+        totalWidth--;
+    }
+
     const topBorder = "  ┌─" + colWidths.map((w) => "─".repeat(w)).join("─┬─") + "─┐";
     const midBorder = "  ├─" + colWidths.map((w) => "─".repeat(w)).join("─┼─") + "─┤";
     const botBorder = "  └─" + colWidths.map((w) => "─".repeat(w)).join("─┴─") + "─┘";
@@ -74,21 +98,22 @@ function renderTable(tableLines: string[]): string {
     lines.push(`${mdColors.gray}${topBorder}${mdColors.reset}`);
 
     dataRows.forEach((row, rowIdx) => {
-        const formattedCells: string[] = [];
+        const wrappedCells: string[][] = [];
         for (let c = 0; c < colCount; c++) {
             const cell = row[c] || "";
-            const formatted = formatInline(cell);
-            const w = stringWidth(formatted);
-            const padLen = Math.max(0, colWidths[c] - w);
-            formattedCells.push(formatted + " ".repeat(padLen));
+            wrappedCells.push(wrapTerminalText(formatInline(cell), colWidths[c]));
         }
 
         const isHeader = dividerIndex !== -1 && rowIdx === 0;
-        const lineContent = formattedCells
-            .map((c) => (isHeader ? `${mdColors.bold}${c}${mdColors.reset}` : c))
-            .join(` ${mdColors.gray}│${mdColors.reset} `);
-
-        lines.push(`  ${mdColors.gray}│${mdColors.reset} ${lineContent} ${mdColors.gray}│${mdColors.reset}`);
+        const rowHeight = Math.max(...wrappedCells.map(cell => cell.length));
+        for (let lineNo = 0; lineNo < rowHeight; lineNo++) {
+            const lineContent = wrappedCells.map((cell, index) => {
+                const part = cell[lineNo] || "";
+                const padded = part + " ".repeat(Math.max(0, colWidths[index] - stringWidth(part)));
+                return isHeader ? `${mdColors.bold}${padded}${mdColors.reset}` : `${padded}${mdColors.reset}`;
+            }).join(` ${mdColors.gray}│${mdColors.reset} `);
+            lines.push(`  ${mdColors.gray}│${mdColors.reset} ${lineContent} ${mdColors.gray}│${mdColors.reset}`);
+        }
 
         if (isHeader) {
             lines.push(`${mdColors.gray}${midBorder}${mdColors.reset}`);
@@ -101,15 +126,22 @@ function renderTable(tableLines: string[]): string {
 
 /** 渲染带语言标识的边框代码块 */
 function renderCodeBlock(lang: string, codeLines: string[]): string {
-    const langLabel = lang.trim() ? ` ${lang.trim()} ` : "";
-    const topBar = "  ┌─" + langLabel + "─".repeat(Math.max(10, 60 - langLabel.length)) + "┐";
-    const botBar = "  └─" + "─".repeat(Math.max(10, 60)) + "┘";
+    const width = Math.min(80, getTerminalWidth());
+    if (width < 8) {
+        return codeLines.flatMap(line => wrapTerminalText(line)).join("\n");
+    }
+    const langLabel = truncateTerminalText(lang.trim() ? ` ${lang.trim()} ` : "", width - 4);
+    const topBar = "  ┌" + langLabel + "─".repeat(width - 4 - stringWidth(langLabel)) + "┐";
+    const botBar = "  └" + "─".repeat(width - 4) + "┘";
 
     const result: string[] = [];
     result.push(`${mdColors.gray}${topBar}${mdColors.reset}`);
 
     for (const line of codeLines) {
-        result.push(`  ${mdColors.gray}│${mdColors.reset} ${mdColors.white}${line}${mdColors.reset}`);
+        for (const part of wrapTerminalText(line, width - 6)) {
+            const padded = part + " ".repeat(Math.max(0, width - 6 - stringWidth(part)));
+            result.push(`  ${mdColors.gray}│${mdColors.reset} ${mdColors.white}${padded}${mdColors.reset} ${mdColors.gray}│${mdColors.reset}`);
+        }
     }
 
     result.push(`${mdColors.gray}${botBar}${mdColors.reset}`);
@@ -118,7 +150,9 @@ function renderCodeBlock(lang: string, codeLines: string[]): string {
 
 /** 核心 Markdown 解析与美化渲染调度器 */
 export function renderMarkdown(markdown: string): string {
-    if (!markdown) return "";
+    if (!markdown) {
+        return "";
+    }
 
     const lines = markdown.split(/\r?\n/);
     const output: string[] = [];
@@ -129,6 +163,7 @@ export function renderMarkdown(markdown: string): string {
 
     let tableBuffer: string[] = [];
 
+    /** 输出已收集的表格行 */
     const flushTable = () => {
         if (tableBuffer.length > 0) {
             output.push(renderTable(tableBuffer));
@@ -187,7 +222,7 @@ export function renderMarkdown(markdown: string): string {
 
         // 4. 水平分割线
         if (/^(\*{3,}|-{3,}|_{3,})$/.test(trimmed)) {
-            output.push(`  ${mdColors.gray}─────────────────────────────────────────────────────────────${mdColors.reset}`);
+            output.push(`  ${mdColors.gray}${"─".repeat(Math.max(0, Math.min(61, getTerminalWidth() - 2)))}${mdColors.reset}`);
             continue;
         }
 

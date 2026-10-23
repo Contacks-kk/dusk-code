@@ -9,6 +9,8 @@ import { sourceMessage, type ContextMessage, type ContextPersistence } from "./c
 import { historyToolId, restoreRecordedMessages } from "./context/history";
 import { finishRequestDiagnostics, prepareModelRequest, type RequestDiagnostics } from "./runtime/model-adapter";
 import { resolveModelCapabilities, sdkModel, type ResolvedModelCapabilities } from "./runtime/model-profile";
+import type { SkillRuntime } from "./skills/runtime";
+import { isManagedToolFailure } from "./tools/result";
 import { salvageResponse, composeReply, composeIncompleteReport, type ResponseQuality, type SalvagedContent } from "./runtime/response-salvager";
 import {
     detectTruncationStage,
@@ -17,6 +19,7 @@ import {
 } from "./runtime/truncation-recovery";
 
 export interface RunnerOptions extends Partial<GenerationPolicy> {
+    skillRuntime?: SkillRuntime;
     auxiliaryRequests?: RequestDiagnostics[];
     baseUrl: string;
     model: string;
@@ -78,6 +81,7 @@ export class AgentRunner {
     private persistenceError?: string;
     private originalUser?: AgentMessage;
     private contextCoordinator?: ContextCoordinator;
+    private imageInputUnavailable = false;
 
     /** 保存本轮模型连接与生成策略 */
     constructor(private readonly options: RunnerOptions) {
@@ -110,6 +114,49 @@ export class AgentRunner {
     private safeError(error: unknown): string {
         const text = error instanceof Error ? error.message : String(error);
         return this.options.apiKey ? text.split(this.options.apiKey).join("[REDACTED]") : text;
+    }
+
+    /** 将无法送达的图片替换为说明，原始消息仍保留在归档中 */
+    private requestMessages(messages: AgentMessage[]): AgentMessage[] {
+        if (!this.imageInputUnavailable) {
+            return messages;
+        }
+        return messages.map(message => this.messageWithoutImages(message));
+    }
+
+    /** 为仅接受文字的请求保留消息身份并替换图片块 */
+    private messageWithoutImages(message: AgentMessage): AgentMessage {
+        if (message.role === "assistant" || typeof message.content === "string") {
+            return message;
+        }
+        return {
+            ...message,
+            content: message.content.map(block => block.type === "image"
+                ? { type: "text" as const, text: "[图片未送达：当前接口拒绝图片输入，视觉未验收]" }
+                : block)
+        };
+    }
+
+    /** 同步完整技能指令并在预算不足时按优先级明确降级 */
+    private async prepareContext(messages: AgentMessage[], outputBudget: number, signal?: AbortSignal, force = false): Promise<{ messages: AgentMessage[]; systemPrompt: string }> {
+        const coordinator = this.contextCoordinator;
+        if (!coordinator) {
+            throw new Error("上下文协调器尚未初始化");
+        }
+        while (true) {
+            signal?.throwIfAborted();
+            const systemPrompt = this.systemPrompt + (this.options.skillRuntime?.prompt() ?? "");
+            coordinator.setSystemPrompt(systemPrompt);
+            try {
+                const fitted = await coordinator.prepare(messages, outputBudget, signal, force);
+                return { messages: this.requestMessages(fitted), systemPrompt };
+            } catch (error) {
+                signal?.throwIfAborted();
+                if (!/上下文基础预算不足|上下文裁剪后仍无法容纳/.test(String(error)) || !this.options.skillRuntime?.excludeForBudget()) {
+                    throw error;
+                }
+            }
+        }
     }
 
     /** 为循环中新生成的工具结果与恢复指令绑定稳定来源 */
@@ -216,6 +263,7 @@ export class AgentRunner {
             }, 30000);
             /** 保存供应商返回的完整消息与本次调用统计 */
             const captureResponse = (message: AssistantMessage): void => {
+                this.options.skillRuntime?.observeResponse(message, `${summary.attemptNo}:${call.callNo}`);
                 call.phase = "finished";
                 call.response = structuredClone(message);
                 if (call.response.errorMessage) {
@@ -271,15 +319,16 @@ export class AgentRunner {
                     this.annotateCurrent(context.messages, summary);
 
                     // 判断是否需要进行压缩，需要时则阻塞压缩，并向UI推送“正在压缩的消息
-                    let fitted = await this.contextCoordinator.prepare(context.messages, Math.min(summary.maxTokens, this.capabilities.maxOutputTokens ?? summary.maxTokens), controller.signal);
+                    let prepared = await this.prepareContext(context.messages, Math.min(summary.maxTokens, this.capabilities.maxOutputTokens ?? summary.maxTokens), controller.signal);
 
                     controller.signal.throwIfAborted();
                     onCallCompleted();
                     /** 上下文准备完毕后才启动主模型的生成超时 */
                     callStart = lastTokenTime = Date.now();
                     if (this.policy.generationTimeoutMs) timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.policy.generationTimeoutMs);
-                    for (let overflowRetry = 0; overflowRetry < 2; overflowRetry++) {
-                        const request = prepareModelRequest({ ...context, messages: fitted }, this.capabilities,
+                    let overflowRetried = false;
+                    for (let requestAttempt = 0; requestAttempt < 3; requestAttempt++) {
+                        const request = prepareModelRequest({ ...context, systemPrompt: prepared.systemPrompt, messages: prepared.messages }, this.capabilities,
                             summary.attemptNo === 1 ? "task" : "recovery", effort, summary.maxTokens, {
                                 ...options,
                                 apiKey: this.options.apiKey,
@@ -289,11 +338,13 @@ export class AgentRunner {
                             });
                         call.diagnostics = request.diagnostics;
                         call.maxTokens = request.diagnostics.maxTokens;
+                        this.options.skillRuntime?.observeRequest(request.context.messages, `${summary.attemptNo}:${call.callNo}`);
                         if (request.diagnostics.downgrade) {
                             this.emit({ type: "status", content: request.diagnostics.downgrade });
                         }
                         const source = streamSimple(request.model, request.context, request.options);
                         let overflow = false;
+                        let imageRejected = false;
                         let pendingStart: { type: "start"; partial: AssistantMessage } | undefined;
                         for await (const event of source) {
                             lastTokenTime = Date.now();
@@ -304,7 +355,18 @@ export class AgentRunner {
                             if ("partial" in event) { partial = event.partial; dirty = true; }
                             if (event.type === "done" || event.type === "error") {
                                 const message = await source.result();
-                                if (overflowRetry === 0 && message.stopReason === "error" && !message.content.length &&
+                                if (requestAttempt < 2 && !this.imageInputUnavailable && message.stopReason === "error" && !message.content.length &&
+                                    prepared.messages.some(item => typeof item.content !== "string" && item.content.some(block => block.type === "image")) &&
+                                    /image|vision|multimodal|图片|图像|多模态/i.test(message.errorMessage ?? "")) {
+                                    imageRejected = true;
+                                    this.imageInputUnavailable = true;
+                                    request.diagnostics.failure = "image_input_rejected";
+                                    finishRequestDiagnostics(request.diagnostics, message, callStart);
+                                    this.options.auxiliaryRequests?.push({ ...request.diagnostics });
+                                    this.options.skillRuntime?.imageFailure(this.safeError(message.errorMessage || "当前接口拒绝图片输入"));
+                                    break;
+                                }
+                                if (!overflowRetried && requestAttempt < 2 && message.stopReason === "error" && !message.content.length &&
                                     /context.{0,40}(length|window|limit)|maximum context|too many tokens|prompt.{0,30}(too long|tokens)|上下文.*(超|长)/i.test(message.errorMessage ?? "")) {
                                     overflow = true;
                                     break;
@@ -331,10 +393,13 @@ export class AgentRunner {
                             if (pendingStart) { stream.push(pendingStart); pendingStart = undefined; }
                             stream.push(event);
                         }
-                        if (!overflow) break;
+                        if (!overflow && !imageRejected) {
+                            break;
+                        }
+                        overflowRetried ||= overflow;
 
                         // 判断是否需要进行压缩，需要时则阻塞压缩，并向UI推送“正在压缩的消息
-                        fitted = await this.contextCoordinator.prepare(context.messages, call.maxTokens, controller.signal, true);
+                        prepared = await this.prepareContext(context.messages, call.maxTokens, controller.signal, overflow);
                         onCallCompleted();
                     }
                 } catch (error) {
@@ -392,6 +457,13 @@ export class AgentRunner {
         agent = new Agent({
             initialState: { systemPrompt: this.systemPrompt, model, tools, messages: history, thinkingLevel: effort },
             getApiKey: () => this.options.apiKey, streamFn,
+            /** 让工具失败标记在实时消息、检查点和历史回放中保持一致 */
+            afterToolCall: async context => {
+                if (isManagedToolFailure(context.toolCall.name, context.result)) {
+                    return { isError: true };
+                }
+                return undefined;
+            },
             beforeToolCall: async context => {
                 if (this.persistenceError) {
                     agent.abort();
@@ -480,6 +552,7 @@ export class AgentRunner {
                     args: event.args
                 });
             } else if (event.type === "tool_execution_end") {
+                this.options.skillRuntime?.observeTool(event.toolName, toolSteps.get(event.toolCallId)?.args ?? {}, event.result, event.toolCallId, event.isError);
                 const resultStep: AgentExecutionStep = {
                     type: "tool_result",
                     attemptNo: summary.attemptNo,
@@ -549,6 +622,7 @@ export class AgentRunner {
         this.steps.length = 0;
         this.persistenceError = undefined;
         this.contextCoordinator = undefined;
+        this.imageInputUnavailable = false;
         this.originalUser = {
             role: "user", timestamp: started,
             content: images?.length ? [{ type: "text", text: prompt }, ...images] : prompt
@@ -556,6 +630,7 @@ export class AgentRunner {
         const initialRequest = prepareModelRequest({ messages: [] }, this.capabilities, "task",
             this.options.reasoningEffort ?? "high", this.policy.maxTokens).diagnostics;
         const execution: ExecutionRecord = {
+            skills: this.options.skillRuntime?.record,
             auxiliaryRequests: this.options.auxiliaryRequests,
             phase: "running", status: "failed", effectiveCallRefs: [], pendingToolCallIds: [],
             config: {

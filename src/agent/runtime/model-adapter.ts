@@ -4,6 +4,12 @@ import type { ReasoningEffort } from "./generation-policy";
 import { sdkModel, supportedEfforts, validateEffort, type RequestPurpose, type ResolvedModelCapabilities } from "./model-profile";
 import { estimateTokenCount } from "../context/token";
 
+/** 提取请求失败原因并移除当前接口密钥 */
+export function requestErrorMessage(error: unknown, apiKey: string): string {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.split(apiKey || "\0").join("[REDACTED]");
+}
+
 export interface RequestDiagnostics {
     purpose: RequestPurpose;
     provider: string;

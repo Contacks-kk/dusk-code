@@ -3,6 +3,8 @@ import type { PermissionMode } from "../agent/runtime/permission-manager";
 import type { AgentExecutionStep, RunStatus } from "../agent/types";
 import { reasoningLabel } from "../agent/runtime/generation-policy";
 import { renderMarkdown } from "./markdown";
+import { imageArchiveReplacer } from "../utils/image";
+import { getTerminalWidth, wrapTerminalText } from "./terminal-layout";
 
 export const colors = {
     reset: "\x1b[0m",
@@ -62,7 +64,7 @@ export function formatCompactResult(result: any): string {
         if ("result" in result) {
             return formatCompactResult(result.result);
         }
-        const json = JSON.stringify(result);
+        const json = JSON.stringify(result, imageArchiveReplacer);
         return json.length > 80 ? json.slice(0, 80) + "..." : json;
     }
 
@@ -134,7 +136,7 @@ export function formatToolBranchResult(
     const durationSuffix = durationMs !== undefined ? ` ${colors.gray}(${formatDuration(durationMs)})${colors.reset}` : "";
 
     if (isError) {
-        const errorText = typeof result === "string" ? result : (result?.message || JSON.stringify(result));
+        const errorText = typeof result === "string" ? result : (result?.message || JSON.stringify(result, imageArchiveReplacer));
         return `${branchPrefix}${colors.red}Error: ${errorText}${colors.reset}${durationSuffix}`;
     }
 
@@ -221,7 +223,7 @@ export function renderLiveStep(step: AgentExecutionStep): void {
     const turnNo = step.turnNo ?? 1;
 
     if (step.type === "turn_start") {
-        rollingTicker.flush();
+        rollingTicker.setStage("正在等待模型响应");
         turnHistoryManager.recordTurnStart(turnNo);
     } else if (step.type === "thinking_delta") {
         if (step.delta) {
@@ -234,14 +236,14 @@ export function renderLiveStep(step: AgentExecutionStep): void {
         turnHistoryManager.recordOutputLines(1);
         rollingTicker.finish(step.durationMs);
     } else if (step.type === "intermediate_text") {
-        rollingTicker.flush();
+        rollingTicker.setStage("正在准备工具调用");
         turnHistoryManager.recordIntermediateText(turnNo, step.content ?? "");
         const md = renderMarkdown(step.content ?? "");
         turnHistoryManager.recordOutputLines(countScreenLines(md) + 3);
         console.log(`\n${colors.magenta}● Assistant${colors.reset}\n`);
         console.log(md);
     } else if (step.type === "tool_call") {
-        rollingTicker.flush();
+        rollingTicker.setStage(`正在执行 ${step.toolName || "工具"}`);
         turnHistoryManager.recordToolCall(turnNo, {
             id: step.toolCallId || "",
             name: step.toolName || "tool",
@@ -250,7 +252,7 @@ export function renderLiveStep(step: AgentExecutionStep): void {
         turnHistoryManager.recordOutputLines(2);
         console.log(`\n${formatToolHeader(step.toolName || "tool", step.args)}`);
     } else if (step.type === "tool_result") {
-        rollingTicker.flush();
+        rollingTicker.setStage("正在等待模型继续回复");
         turnHistoryManager.recordToolResult(
             turnNo,
             step.toolCallId || "",
@@ -264,8 +266,9 @@ export function renderLiveStep(step: AgentExecutionStep): void {
         console.log(`${branchLine}${hint}`);
     } else if (step.type === "turn_end") {
         turnHistoryManager.finishTurn(turnNo);
+        rollingTicker.setStage("正在整理回复");
     } else if (step.type === "status") {
-        rollingTicker.flush();
+        rollingTicker.setStage(step.content ?? "生成状态更新");
         turnHistoryManager.recordOutputLines(2);
         console.log(`\n${colors.cyan}↻ ${step.content ?? "生成状态更新"}${colors.reset}`);
     }
@@ -295,18 +298,28 @@ export function printHeaderBanner(info: {
     const sessionText = info.sessionId ? `#${info.sessionId}` : "(未创建，首次发送自动生成)";
     const modelText = `${colors.bold}${info.modelName || "deepseek-chat"}${colors.reset} ${colors.gray}(${info.reasoningDisplay ?? reasoningLabel(info.modelName || "deepseek-chat", info.reasoningEffort || "high")})${colors.cyan}`;
 
-    console.log(`
-${colors.cyan}╭─────────────────────────────────────────────────────────────────────────────╮
-│ ${colors.bold}✦ DUSK CLI${colors.reset}${colors.cyan}                                            ${colors.gray}Autonomous Code Agent${colors.cyan} │
-│                                                                             │
-│  ${colors.white}Project :${colors.reset} ${colors.bold}${info.projectName}${colors.reset} ${colors.gray}(${info.projectPath})${colors.cyan}
-│  ${colors.white}Session :${colors.reset} ${colors.magenta}${sessionText}${colors.reset}${colors.cyan}
-│  ${colors.white}Model   :${colors.reset} ${modelText}
-│  ${colors.white}Security:${colors.reset} ${permBadge}${colors.cyan}
-│                                                                             │
-│  ${colors.gray}常用指令: /help · /image · /model · /plan · /turn · /permissions · /compact · exit${colors.cyan} │
-╰─────────────────────────────────────────────────────────────────────────────╯${colors.reset}
-`);
+    const width = Math.min(90, getTerminalWidth());
+    const content = [
+        `${colors.bold}✦ DUSK CLI${colors.reset}  ${colors.gray}Autonomous Code Agent${colors.reset}`,
+        "",
+        `${colors.white}Project :${colors.reset} ${colors.bold}${info.projectName}${colors.reset} ${colors.gray}(${info.projectPath})${colors.reset}`,
+        `${colors.white}Session :${colors.reset} ${colors.magenta}${sessionText}${colors.reset}`,
+        `${colors.white}Model   :${colors.reset} ${modelText}${colors.reset}`,
+        `${colors.white}Security:${colors.reset} ${permBadge}`,
+        "",
+        `${colors.gray}常用指令: /help · /image · /model · /plan · /turn · /permissions · /compact · exit${colors.reset}`
+    ];
+    if (width < 8) {
+        console.log(content.flatMap(line => wrapTerminalText(line, width)).join("\n"));
+        return;
+    }
+
+    // 所有边框行使用相同的显示宽度，长路径与中文提示在框内折行
+    const innerWidth = width - 4;
+    const rows = content.flatMap(line => wrapTerminalText(line, innerWidth)).map(line =>
+        `${colors.cyan}│${colors.reset} ${line}${" ".repeat(Math.max(0, innerWidth - stringWidth(line)))} ${colors.cyan}│${colors.reset}`
+    );
+    console.log(`\n${colors.cyan}╭${"─".repeat(width - 2)}╮${colors.reset}\n${rows.join("\n")}\n${colors.cyan}╰${"─".repeat(width - 2)}╯${colors.reset}\n`);
 }
 
 /** 打印图片附件提示标签 */
@@ -337,7 +350,8 @@ ${colors.cyan}${colors.bold}DUSK CLI 命令指引${colors.reset}
   ${colors.yellow}/image [路径] [任务]${colors.reset}    附加本地图片或自动提取剪贴板截图进行视图分析
   ${colors.yellow}/model [name] [effort]${colors.reset} 切换语言模型与推理等级: xhigh | high | medium | low | off
   ${colors.yellow}/plan <任务需求>${colors.reset}        显式进入规划模式，深入只读调研代码并输出实施计划
-  ${colors.yellow}/skill [name]${colors.reset}           浏览或激活内置/项目扩展技能 (如 code-review, bug-fix)
+  ${colors.yellow}/skill [name]${colors.reset}           查看技能；指定名称后固定到当前会话
+  ${colors.yellow}/skill off <name> | clear${colors.reset}  关闭技能，或清除手动设置并恢复自动选择
   ${colors.yellow}/permissions [mode]${colors.reset}    查看或切换权限: read-only | workspace | full-access
   ${colors.yellow}/compact${colors.reset}               显式压缩当前会话上下文，释放 Token 消耗
   ${colors.yellow}/turn [n]${colors.reset}              查看执行记录的完整思考过程、工具调用与响应结果

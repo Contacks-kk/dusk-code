@@ -5,6 +5,7 @@ import { reasoningLabel } from "../agent/runtime/generation-policy";
 import { turnHistoryManager } from "./turn-history";
 import { turnInspector } from "./turn-inspector";
 import { mouseTracker } from "./mouse-tracker";
+import { getTerminalWidth, truncateTerminalText, wrapTerminalText } from "./terminal-layout";
 
 export interface CommandOption {
     name: string;
@@ -16,7 +17,7 @@ export const SLASH_COMMANDS: CommandOption[] = [
     { name: "/image", description: "视图输入：自动提取剪贴板截图或加载拖拽图片进行视觉分析", requiresArg: true },
     { name: "/model", description: "模型调节：上下键切换模型与推理思考等级 (Reasoning Effort)" },
     { name: "/plan", description: "规划模式：深入只读调研代码并输出实施方案", requiresArg: true },
-    { name: "/skill", description: "技能系统：查看可用专业技能并按需交互式激活" },
+    { name: "/skill", description: "会话技能：查看、固定启用、off 关闭、clear 恢复自动选择" },
     { name: "/permissions", description: "权限调节：上下键切换 Read Only / Workspace / Full Access" },
     { name: "/compact", description: "上下文压缩：显式压缩历史大报文并释放 Token" },
     { name: "/resume", description: "会话恢复：上下键选择当前工程历史会话" },
@@ -61,6 +62,7 @@ export async function interactiveSelect<T>(
 
     let selectedIndex = 0;
     let isFirstRender = true;
+    let headerHeight = 1;
 
     /** 渲染选项列表 */
     const render = () => {
@@ -68,7 +70,9 @@ export async function interactiveSelect<T>(
             // 回退光标至选项第一行
             process.stdout.write(`\x1b[${items.length}A\r`);
         } else {
-            console.log(`\n${colors.cyan}? ${title}${colors.reset} ${colors.gray}(方向键 ↑/↓ 切换，Enter 确认，Esc 取消)${colors.reset}`);
+            const headerLines = wrapTerminalText(`${colors.cyan}? ${title}${colors.reset} ${colors.gray}(方向键 ↑/↓ 切换，Enter 确认，Esc 取消)${colors.reset}`);
+            headerHeight = headerLines.length;
+            console.log(`\n${headerLines.join("\n")}`);
             isFirstRender = false;
         }
 
@@ -80,7 +84,7 @@ export async function interactiveSelect<T>(
                 ? `${colors.cyan}${colors.bold}${item.label}${colors.reset}`
                 : `${colors.white}${item.label}${colors.reset}`;
             const hint = item.hint ? ` ${colors.gray}(${item.hint})${colors.reset}` : "";
-            process.stdout.write(`\x1b[2K${pointer}${label}${hint}\n`);
+            process.stdout.write(`\x1b[2K${truncateTerminalText(`${pointer}${label}${hint}`)}${colors.reset}\n`);
         }
     };
 
@@ -117,7 +121,7 @@ export async function interactiveSelect<T>(
             // Esc 取消选择
             if (key.name === "escape") {
                 cleanup();
-                process.stdout.write(`\x1b[${items.length + 1}A\r\x1b[0J`);
+                process.stdout.write(`\x1b[${items.length + headerHeight}A\r\x1b[0J`);
                 console.log(`${colors.gray}已取消操作${colors.reset}\n`);
                 resolve(null);
                 return;
@@ -138,7 +142,7 @@ export async function interactiveSelect<T>(
             // 回车确认选择
             if (key.name === "return" || key.name === "enter") {
                 cleanup();
-                process.stdout.write(`\x1b[${items.length + 1}A\r\x1b[0J`);
+                process.stdout.write(`\x1b[${items.length + headerHeight}A\r\x1b[0J`);
                 const chosen = items[selectedIndex];
                 console.log(`${colors.green}✔ ${title}:${colors.reset} ${colors.bold}${chosen.label}${colors.reset}\n`);
                 resolve(chosen.value);
@@ -184,13 +188,15 @@ export async function interactivePrompt(
     let selectedMatchIndex = 0;
     let isFirstRender = true;
     let linesAbove = 1; // 记录当前光标距离整个输入组件顶部的垂直行数
+    let renderedInputLines: string[] = [];
+    let renderedCursorRow = 0;
+    let renderedCursorText = "";
 
     const placeholderText = context.placeholder || "How can I help you?";
     const bg = "\x1b[48;5;236m"; // Codex 暗灰输入框通体背景
     const reset = "\x1b[0m";
 
     // 专用前景色调，避免使用 reset 导致整行背景色撕裂脱落
-    const FG_PROMPT = "\x1b[38;5;250m";      // 前缀 › 浅中灰
     const FG_INPUT = "\x1b[38;5;255m";       // 用户输入 纯白高亮
     const FG_PLACEHOLDER = "\x1b[38;5;244m"; // 占位符 中灰
     const FG_STATUS_MODEL = "\x1b[38;5;222m"; // 状态栏模型 亮暖黄
@@ -252,10 +258,15 @@ export async function interactivePrompt(
             process.stdout.write(`${bg}\x1b[K${reset}\n`);
 
             // 2. Line 2: 输入主体行（整行保持 bg，绝不使用 reset，彻底杜绝背景色穿帮）
-            if (buffer.length === 0) {
-                process.stdout.write(`${bg}  ${FG_PROMPT}› ${FG_PLACEHOLDER}${placeholderText}${bg}\x1b[K${reset}\n`);
-            } else {
-                process.stdout.write(`${bg}  ${FG_PROMPT}› ${FG_INPUT}${buffer}${bg}\x1b[K${reset}\n`);
+            const matches = getMatches();
+            const allInputLines = wrapTerminalText(`  › ${buffer || placeholderText}`);
+            const cursorLines = wrapTerminalText(`  › ${buffer.slice(0, cursorIndex)}`);
+            const maxInputLines = Math.max(1, (process.stdout.rows || 24) - matches.length - 4);
+            const inputOffset = Math.max(0, cursorLines.length - maxInputLines);
+            const inputLines = allInputLines.slice(inputOffset, inputOffset + maxInputLines);
+            const inputColor = buffer.length === 0 ? FG_PLACEHOLDER : FG_INPUT;
+            for (const line of inputLines) {
+                process.stdout.write(`${bg}${inputColor}${line}${bg}\x1b[K${reset}\n`);
             }
 
             // 3. Line 3: 下 padding 行（纯背景色整行铺满）
@@ -263,11 +274,10 @@ export async function interactivePrompt(
 
             // 4. Line 4: 状态信息条（缩进 2 空格，模型 思考等级 · 路径）
             process.stdout.write(
-                `  ${FG_STATUS_MODEL}${context.modelName}${reset} ${FG_STATUS_EFFORT}${context.reasoningDisplay ?? reasoningLabel(context.modelName, context.reasoningEffort)}${reset} ${FG_STATUS_DOT}·${reset} ${FG_STATUS_PATH}${context.projectPath}${reset}\n`
+                `${truncateTerminalText(`  ${FG_STATUS_MODEL}${context.modelName}${reset} ${FG_STATUS_EFFORT}${context.reasoningDisplay ?? reasoningLabel(context.modelName, context.reasoningEffort)}${reset} ${FG_STATUS_DOT}·${reset} ${FG_STATUS_PATH}${context.projectPath}${reset}`)}${reset}\n`
             );
 
             // 5. Line 5+: 若有斜杠命令候选，顺延展示在状态栏下方
-            const matches = getMatches();
             let extraDropdownLines = 0;
             if (matches.length > 0) {
                 if (selectedMatchIndex >= matches.length) {
@@ -283,20 +293,15 @@ export async function interactivePrompt(
                     const desc = isSelected
                         ? `${colors.cyan}${m.description}${colors.reset}`
                         : `${colors.gray}${m.description}${colors.reset}`;
-                    process.stdout.write(`\x1b[2K${pointer}${name} ${desc}\n`);
+                    process.stdout.write(`\x1b[2K${truncateTerminalText(`${pointer}${name} ${desc}`)}${reset}\n`);
                 }
                 extraDropdownLines = matches.length;
             }
 
             // 6. 动态计算输入行折行与光标精准回退
-            const cols = Math.max(20, process.stdout.columns || 80);
-            const fullText = buffer.length === 0 ? placeholderText : buffer;
-            const totalInputWidth = 4 + stringWidth(fullText);
-            const inputLineCount = Math.max(1, Math.floor(totalInputWidth / cols) + 1);
-
-            const cursorWidth = 4 + stringWidth(buffer.slice(0, cursorIndex));
-            const cursorRow = Math.floor(cursorWidth / cols);
-            const cursorCol = cursorWidth % cols;
+            const inputLineCount = inputLines.length;
+            const cursorRow = cursorLines.length - 1 - inputOffset;
+            const cursorCol = stringWidth(cursorLines.at(-1) || "");
 
             // 回退到光标所在行：3行基础跨度 + 下拉菜单行数 + Line 2 末行向上到 cursorRow 的距离
             const totalLinesBelow = 3 + extraDropdownLines + Math.max(0, inputLineCount - 1 - cursorRow);
@@ -309,6 +314,9 @@ export async function interactivePrompt(
 
             // 记录当前光标距离组件顶部的行数，用于下次渲染回退清屏
             linesAbove = 1 + cursorRow;
+            renderedInputLines = inputLines;
+            renderedCursorRow = cursorRow;
+            renderedCursorText = cursorLines.at(-1) || "";
 
             process.stdout.write("\x1b[?25h"); // 恢复光标可见
         };
@@ -316,6 +324,7 @@ export async function interactivePrompt(
         /** 清理输入监听与恢复光标 */
         const cleanup = () => {
             input.off("keypress", onKeypress);
+            process.stdout.off("resize", onResize);
             if (process.stdin.isTTY && !mouseTracker.isActive()) {
                 process.stdin.setRawMode(false);
             }
@@ -452,7 +461,17 @@ export async function interactivePrompt(
             }
         };
 
+        /** 窗口改变后重新计算输入折行与光标位置 */
+        const onResize = () => {
+            const columns = getTerminalWidth() + 1;
+            const precedingRows = renderedInputLines.slice(0, renderedCursorRow)
+                .reduce((sum, line) => sum + wrapTerminalText(line, columns).length, 0);
+            linesAbove = 1 + precedingRows + wrapTerminalText(renderedCursorText, columns).length - 1;
+            render();
+        };
+
         render();
+        process.stdout.on("resize", onResize);
         input.on("keypress", onKeypress);
     });
 }

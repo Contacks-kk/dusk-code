@@ -10,8 +10,10 @@ import { interactivePrompt, interactiveSelect } from "./cli/interactive-prompt";
 import { extractImagePaths } from "./utils/image";
 import { mouseTracker } from "./cli/mouse-tracker";
 import { liveInputManager } from "./cli/live-input";
+import { rollingTicker } from "./cli/rolling-ticker";
 import { isPlanConfirmationPrompt, promptPlanConfirmation } from "./cli/plan-confirmation";
 import { skillRegistry } from "./agent/skills/registry";
+import { turnHistoryManager } from "./cli/turn-history";
 import type { AgentRunResult } from "./agent/types";
 
 /** 检测异常是否为 Ctrl+C 中断引发的取消错误 */
@@ -73,14 +75,23 @@ async function startCli(): Promise<void> {
     /** 越界或高危操作通过交互式上下键进行提权确认 */
     const askUserPermission = async (promptText: string): Promise<boolean> => {
         const cleanPrompt = promptText.replace(/\x1b\[[0-9;]*m/g, "").replace(/\(y\/N\):.*/, "").trim();
-        const confirmed = await interactiveSelect(
-            [
-                { label: "拒绝 (推荐：安全拦截越界操作)", value: false },
-                { label: "允许 (授权 Agent 访问工作区外部路径)", value: true }
-            ],
-            cleanPrompt || "越界沙箱操作授权确认"
-        );
-        return confirmed === true;
+
+        // 菜单独占键盘与光标，避免进度刷新覆盖待确认的操作内容
+        rollingTicker.pause();
+        liveInputManager.pause();
+        try {
+            const confirmed = await interactiveSelect(
+                [
+                    { label: "拒绝 (推荐：安全拦截越界操作)", value: false },
+                    { label: "允许 (授权 Agent 访问工作区外部路径)", value: true }
+                ],
+                cleanPrompt || "越界沙箱操作授权确认"
+            );
+            return confirmed === true;
+        } finally {
+            liveInputManager.resume();
+            rollingTicker.resume();
+        }
     };
 
     /** 为所有 CLI 对话入口绑定统一取消控制器并开放执行态输入框 */
@@ -89,6 +100,7 @@ async function startCli(): Promise<void> {
 
         // 开放执行期输入框供用户键入
         liveInputManager.start();
+        rollingTicker.start();
 
         try {
             // 调用 AgentService 执行对话链路
@@ -101,6 +113,7 @@ async function startCli(): Promise<void> {
             });
         } finally {
             // 关闭执行期输入框并清理状态
+            rollingTicker.flush();
             liveInputManager.stop();
             activeController = undefined;
         }
@@ -113,6 +126,7 @@ async function startCli(): Promise<void> {
         isExplicitPlan = false
     ): Promise<void> => {
         currentSessionId = result.sessionId;
+        turnHistoryManager.recordExecution(result.turnNo, result.execution);
 
         // 1. 渲染最终回复（原生 Markdown 终端美化）
         renderAssistantReply(result.reply, result.status);
@@ -231,7 +245,7 @@ async function startCli(): Promise<void> {
                 }
 
                 if (cmd === "/skill" || cmd === "/skills") {
-                    await commandHandler.handleSkill(cmdArg);
+                    await commandHandler.handleSkill(cmdArg, currentSessionId);
                     continue;
                 }
 

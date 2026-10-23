@@ -10,6 +10,9 @@ export function migrateDatabase(database: Database.Database): void {
         /** 查询指定表的已有字段名 */
         const columns = (table: string) => (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name);
         if (!columns("session").includes("project_id")) database.exec("ALTER TABLE session ADD COLUMN project_id INTEGER REFERENCES project(id)");
+        if (!columns("session").includes("skill_state_json")) {
+            database.exec(`ALTER TABLE session ADD COLUMN skill_state_json TEXT NOT NULL DEFAULT '{"pinned":[],"disabled":[]}'`);
+        }
         if (!columns("turn").includes("execution_json")) database.exec("ALTER TABLE turn ADD COLUMN execution_json TEXT");
         database.exec(`CREATE TABLE IF NOT EXISTS context_artifact (
             id TEXT PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES session(id),

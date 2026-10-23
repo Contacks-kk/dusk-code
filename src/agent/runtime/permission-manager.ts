@@ -26,6 +26,9 @@ const EXECUTE_TOOLS = new Set(["execute_command"]);
 /** 只读探索类工具 */
 export const READ_TOOLS = new Set([
     "read_file",
+    "read_image",
+    "activate_skill",
+    "read_skill_reference",
     "read_code",
     "list_files",
     "grep_search",

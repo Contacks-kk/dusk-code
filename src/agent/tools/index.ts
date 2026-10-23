@@ -3,6 +3,7 @@ export * from "./system/time.tool";
 export * from "./system/calc.tool";
 export * from "./code/list-files.tool";
 export * from "./code/read-file.tool";
+export * from "./code/read-image.tool";
 export * from "./code/grep-search.tool";
 export * from "./code/apply-patch.tool";
 export * from "./code/write-file.tool";

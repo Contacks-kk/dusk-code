@@ -21,7 +21,10 @@ import { sdkModel } from "../agent/runtime/model-profile";
 import type { RequestDiagnostics } from "../agent/runtime/model-adapter";
 import { modelConfigManager } from "../agent/runtime/model-config";
 import { loadImageAsImageContent } from "../utils/image";
-import { restoreRecordedMessages, annotateLegacyMessages } from "../agent/context/history";
+import { restoreRecordedMessages, annotateLegacyMessages, restoreToolContent } from "../agent/context/history";
+import { prepareTurnSkills } from "../agent/skills/preparation";
+import { createSkillTools } from "../agent/tools/skill/skill.tool";
+import { projectService } from "./project.service";
 
 export class AgentService {
     /** 显式压缩已有会话视图，保留所有原始历史 */
@@ -140,19 +143,11 @@ export class AgentService {
                     flushPendingToolCalls(msgTime);
                     try {
                         const parsed = JSON.parse(msg.content);
-                        let resultText = "";
-                        if (parsed.result && typeof parsed.result === "object" && parsed.result.content && Array.isArray(parsed.result.content)) {
-                            resultText = parsed.result.content.map((c: any) => c.text || "").join("\n");
-                        } else if (typeof parsed.result === "string") {
-                            resultText = parsed.result;
-                        } else {
-                            resultText = JSON.stringify(parsed.result);
-                        }
                         agentMessages.push({
                             role: "toolResult",
                             toolCallId: parsed.id,
                             toolName: parsed.tool,
-                            content: [{ type: "text", text: resultText }],
+                            content: restoreToolContent(parsed.result, parsed.tool),
                             isError: !!parsed.isError,
                             timestamp: msgTime
                         });
@@ -264,7 +259,22 @@ export class AgentService {
 
             // 5. 每轮快照模型配置，重试沿用同一权限、输入与预算策略
             const currentPermissionMode = permissionManager.getMode();
-            const systemPrompt = buildSystemPrompt({ permissionMode: currentPermissionMode });
+            const currentProject = targetSession.projectId ? await projectService.getProjectById(targetSession.projectId) : undefined;
+            const projectRoot = currentProject?.rootPath ?? process.cwd();
+
+            // 为当前任务准备会话固定和自动选择的技能
+            const skillRuntime = await prepareTurnSkills({
+                projectRoot,
+                skillState: targetSession.skillStateJson,
+                userInput,
+                history: rawHistory,
+                modelConfig,
+                onStatus: text => opts.onStep?.({ type: "status", content: text, timestamp: Date.now() }),
+                onDiagnostics: diagnostics => auxiliaryRequests.push(diagnostics),
+                signal: opts.signal
+            });
+            const systemPrompt = buildSystemPrompt({ permissionMode: currentPermissionMode, skillCatalog: skillRuntime.registry.generatePromptCatalog() }) +
+                `\n目标项目工作目录：${projectRoot}。文件操作使用该目录下的路径，命令的 cwd 明确使用该目录。`;
             const persistedSteps = new Set<string>();
 
             /** 原子保存执行快照和新增工具步骤，重复检查点不重复插入 */
@@ -291,6 +301,7 @@ export class AgentService {
             };
 
             const runner = new AgentRunner({
+                skillRuntime,
                 auxiliaryRequests,
                 baseUrl: modelConfig.baseUrl || config.llm.baseUrl,
                 model: modelConfig.model || config.llm.model,
@@ -304,7 +315,8 @@ export class AgentService {
                 currentTurnId: createdTurn.id,
                 currentTurnNo: nextTurnNo,
                 userMessageId: userMessage.id,
-                tools: [...toolRegistry.getAll(), createRecallTool(contextStore)],
+                tools: [...toolRegistry.getAll().filter(tool => tool.name !== "activate_skill" && tool.name !== "read_skill_reference"),
+                    ...createSkillTools(skillRuntime), createRecallTool(contextStore)],
                 maxTokens: modelConfig.maxTokens,
                 retryMaxTokens: modelConfig.retryMaxTokens,
                 generationTimeoutMs: modelConfig.generationTimeoutMs,
@@ -333,8 +345,9 @@ export class AgentService {
                 });
             }
 
-            // 6. 编排状态机恢复算法并返回可持久化的最终执行结果
+            //* 6. 重点： 编排状态机恢复算法并返回可持久化的最终执行结果
             const output = await runner.run(userInput, imageContents);
+            output.reply += skillRuntime.finish();
 
             // 7. 持久化工具调用过程及最终助手回复（更新DB数据）
             saveCheckpoint(output.execution, output.contextSteps);

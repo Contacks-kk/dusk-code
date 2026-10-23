@@ -1,29 +1,56 @@
 import * as readline from "node:readline";
 import { mouseTracker } from "./mouse-tracker";
+import { getTerminalWidth, truncateTerminalText, wrapTerminalText } from "./terminal-layout";
 
 export class LiveInputManager {
     private isRunning = false;
     private buffer = "";
     private pendingInputs: string[] = [];
     private originalWrite?: typeof process.stdout.write;
+    private originalErrorWrite?: typeof process.stderr.write;
+    private status = "";
+    private isSuspended = false;
+    private renderedLine = "";
+
+    /** 更新执行状态并在空输入条中展示进度 */
+    public setStatus(status: string): void {
+        this.status = status;
+        this.renderInputLine();
+    }
 
     /** 检查当前执行态输入框是否处于激活状态 */
     public isActive(): boolean {
-        return this.isRunning;
+        return this.isRunning && !this.isSuspended;
+    }
+
+    /** 弹出确认菜单前暂停输入条和键盘处理 */
+    public pause(): void {
+        if (this.isActive()) {
+            this.originalWrite?.("\r\x1b[2K");
+        }
+        this.isSuspended = true;
+        this.renderedLine = "";
+    }
+
+    /** 确认菜单关闭后恢复暂存的输入 */
+    public resume(): void {
+        this.isSuspended = false;
+        this.renderInputLine();
     }
 
     /** 渲染当前执行态输入条 */
     private renderInputLine(): void {
-        if (!this.isRunning || !process.stdout.isTTY) {
+        if (!this.isActive() || !process.stdout.isTTY) {
             return;
         }
 
-        const placeholder = this.buffer.length === 0
-            ? "\x1b[38;5;242m(Agent 执行中，输入内容可在此键入...)\x1b[0m"
-            : "";
         const writeFn = this.originalWrite || process.stdout.write.bind(process.stdout);
+        const content = this.buffer.length > 0
+            ? `\x1b[38;5;255m${wrapTerminalText(this.buffer, Math.max(2, getTerminalWidth() - 2)).at(-1)}`
+            : this.status || "\x1b[38;5;242m(Agent 执行中，可继续输入)\x1b[0m";
 
-        writeFn(`\r\x1b[2K\x1b[38;5;250m› \x1b[38;5;255m${this.buffer}\x1b[0m${placeholder}`);
+        this.renderedLine = truncateTerminalText(`\x1b[38;5;250m› ${content}`);
+        writeFn(`\r\x1b[2K${this.renderedLine}\x1b[0m`);
     }
 
     /** 启动执行期输入框监听，允许用户在 Agent 运算期间键入内容 */
@@ -33,23 +60,16 @@ export class LiveInputManager {
         }
 
         this.isRunning = true;
+        this.isSuspended = false;
         this.buffer = "";
         this.pendingInputs = [];
+        process.stdout.on("resize", this.onResize);
 
         // 劫持 stdout.write，在日志输出前抹除输入条，输出后恢复输入条
         this.originalWrite = process.stdout.write.bind(process.stdout);
-        const original = this.originalWrite;
-
-        process.stdout.write = ((chunk: any, encoding?: any, callback?: any) => {
-            if (this.isRunning) {
-                original("\r\x1b[2K");
-            }
-            const res = original(chunk, encoding, callback);
-            if (this.isRunning) {
-                this.renderInputLine();
-            }
-            return res;
-        }) as typeof process.stdout.write;
+        this.originalErrorWrite = process.stderr.write.bind(process.stderr);
+        process.stdout.write = this.wrapOutput(this.originalWrite);
+        process.stderr.write = this.wrapOutput(this.originalErrorWrite);
 
         const input = mouseTracker.isActive() ? mouseTracker.input : process.stdin;
         readline.emitKeypressEvents(input);
@@ -58,9 +78,41 @@ export class LiveInputManager {
         this.renderInputLine();
     }
 
+    /** 输出日志时让出输入行，保留无换行输出和错误信息 */
+    private wrapOutput(write: typeof process.stdout.write): typeof process.stdout.write {
+        return ((chunk: any, encoding?: any, callback?: any) => {
+            if (this.isActive()) {
+                this.originalWrite?.("\r\x1b[2K");
+            }
+            const result = write(chunk, encoding, callback);
+            if (this.isActive()) {
+                const text = String(chunk);
+                if (text.length > 0 && !text.endsWith("\n")) {
+                    this.originalWrite?.("\n");
+                }
+                this.renderInputLine();
+            }
+            return result;
+        }) as typeof process.stdout.write;
+    }
+
+    /** 窗口改变后按当前列数重绘输入条 */
+    private onResize = (): void => {
+        if (!this.isActive()) {
+            return;
+        }
+
+        // 窗口缩小时先移除旧输入条折出的行，避免残留在新状态上方
+        const rows = wrapTerminalText(this.renderedLine, getTerminalWidth() + 1).length;
+        if (rows > 1) {
+            this.originalWrite?.(`\r\x1b[${rows - 1}A\x1b[0J`);
+        }
+        this.renderInputLine();
+    };
+
     /** 响应执行期间的键盘按键并维护输入缓冲 */
     private onKeypress = (str: string, key: readline.Key): void => {
-        if (!this.isRunning || !key) {
+        if (!this.isActive() || !key) {
             return;
         }
 
@@ -118,6 +170,7 @@ export class LiveInputManager {
         }
 
         this.isRunning = false;
+        process.stdout.off("resize", this.onResize);
         const input = mouseTracker.isActive() ? mouseTracker.input : process.stdin;
         input.off("keypress", this.onKeypress);
 
@@ -126,6 +179,10 @@ export class LiveInputManager {
             process.stdout.write = this.originalWrite;
             this.originalWrite = undefined;
         }
+        if (this.originalErrorWrite) {
+            process.stderr.write = this.originalErrorWrite;
+            this.originalErrorWrite = undefined;
+        }
 
         const captured = [...this.pendingInputs];
         if (this.buffer.trim().length > 0) {
@@ -133,6 +190,9 @@ export class LiveInputManager {
         }
         this.buffer = "";
         this.pendingInputs = [];
+        this.status = "";
+        this.isSuspended = false;
+        this.renderedLine = "";
 
         return captured;
     }

@@ -1,11 +1,13 @@
 import { sqliteTable, integer, text } from "drizzle-orm/sqlite-core";
 import { project } from "./project";
+import type { SessionSkillState } from "../../agent/skills/types";
 
 /** 会话实体表模型 */
 export const session = sqliteTable("session", {
     id: integer("id").primaryKey({ autoIncrement: true }),
     projectId: integer("project_id").references(() => project.id),
     title: text("title", { length: 255 }),
+    skillStateJson: text("skill_state_json", { mode: "json" }).$type<SessionSkillState>().notNull().default({ pinned: [], disabled: [] }),
     createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
     updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date())
 });

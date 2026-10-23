@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ContextRecord } from "./context/types";
 import type { RequestDiagnostics } from "./runtime/model-adapter";
+import type { SkillExecutionRecord } from "./skills/types";
 
 export type StepType = 
 "thought" | 
@@ -82,6 +83,7 @@ export interface GenerationAttempt {
 }
 
 export interface ExecutionRecord {
+    skills?: SkillExecutionRecord;
     auxiliaryRequests?: RequestDiagnostics[];
     context?: ContextRecord;
     phase?: "running" | "recovering" | "finished";

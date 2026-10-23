@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { imageArchiveReplacer } from "../../utils/image";
 import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
 import type { Model, ToolResultMessage } from "@mariozechner/pi-ai";
 import { boundedText } from "./recall.tool";
@@ -37,6 +38,11 @@ export class ContextCoordinator {
         this.modelKey = `${options.model.baseUrl}:${options.model.id}`;
         this.record = { checks: 0, revision: options.persistence?.revision ?? 0,
             inputBudget: 0, triggerTokens: 0, targetTokens: 0, estimatedInputTokens: 0, events: [] };
+    }
+
+    /** 同步本次请求的技能指令，使预算统计与实际请求一致 */
+    setSystemPrompt(systemPrompt: string): void {
+        this.options.systemPrompt = systemPrompt;
     }
 
     /** 使用供应商实际输入用量向上校准同模型的预算估算 */
@@ -163,11 +169,11 @@ export class ContextCoordinator {
             const perResult = Math.max(32, Math.floor((allowance - fixed) / tools.length) - 100);
             return entry.messages.map(message => message.role !== "toolResult" ? message : { ...message, content: [{ type: "text", text:
                 `【历史结果片段，原文 ${entry.sources.find(source => source.ref.includes(`tool:${message.toolCallId}`))?.ref ?? entry.sources.at(-1)!.ref}】\n` +
-                this.excerpt(JSON.stringify(message.content), perResult) }] });
+                this.excerpt(JSON.stringify(message.content, imageArchiveReplacer), perResult) }] });
         }
         const receipts = tools.map(tool => `${tool.toolName} [${tool.toolCallId}] ${tool.isError ? "返回错误" : "已返回结果"}`).join("\n");
         return [contextNotice(`【历史执行片段；完整原文请用 recall_context 回查 ${entry.sources[0].ref}】\n` +
-            boundedText(receipts, Math.floor(allowance / 3)) + "\n" + this.excerpt(JSON.stringify(entry.messages.map(message => message.content)), Math.floor(allowance / 2)))];
+            boundedText(receipts, Math.floor(allowance / 3)) + "\n" + this.excerpt(JSON.stringify(entry.messages.map(message => message.content), imageArchiveReplacer), Math.floor(allowance / 2)))];
     }
 
     /** 合并相邻省略范围，保持后续循环的占位信息有界 */

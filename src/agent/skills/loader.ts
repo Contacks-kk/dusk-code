@@ -137,21 +137,21 @@ export class SkillLoader {
         }
         const builtinSkills = await this.scanSkillRoot(builtinRoot, "builtin");
         for (const s of builtinSkills) {
-            skillMap.set(s.name, s);
+            skillMap.set(s.name.toLowerCase(), s);
         }
 
         // 2. 用户家目录全局技能 ~/.dusk/skills (次高优先级，覆盖同名内置技能)
         const userRoot = path.join(os.homedir(), ".dusk", "skills");
         const userSkills = await this.scanSkillRoot(userRoot, "user");
         for (const s of userSkills) {
-            skillMap.set(s.name, s);
+            skillMap.set(s.name.toLowerCase(), s);
         }
 
         // 3. 项目工作区技能 <cwd>/.dusk/skills (最高优先级，覆盖同名全局/内置技能)
         const projectRoot = path.join(projectCwd, ".dusk", "skills");
         const projectSkills = await this.scanSkillRoot(projectRoot, "project");
         for (const s of projectSkills) {
-            skillMap.set(s.name, s);
+            skillMap.set(s.name.toLowerCase(), s);
         }
 
         return skillMap;

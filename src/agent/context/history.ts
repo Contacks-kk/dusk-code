@@ -1,8 +1,39 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage } from "@mariozechner/pi-ai";
+import type { AssistantMessage, ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { ExecutionRecord } from "../types";
 import { createHash } from "node:crypto";
 import { sourceMessage, type ContextMessage } from "./types";
+import { isToolRecord, readToolContent, readToolDetails } from "../tools/result";
+
+/** 判断旧版激活结果是否携带已经过期的完整技能正文 */
+function isLegacyActivation(content: unknown[] | undefined, toolName?: string): boolean {
+    return toolName === "activate_skill" && Boolean(content?.some(block => isToolRecord(block) &&
+        block.type === "text" && typeof block.text === "string" && block.text.includes("### 技能执行规范与工作流")));
+}
+
+/** 还原工具文本和图片，旧版激活正文只转换为历史回执 */
+export function restoreToolContent(result: unknown, toolName?: string): Array<TextContent | ImageContent> {
+    const blocks = readToolContent(result);
+    if (isLegacyActivation(blocks, toolName)) {
+        const details = readToolDetails(result);
+        return [{ type: "text", text: `历史技能加载回执：${details?.skillName ?? "详见归档"}；当前是否生效以本轮技能状态为准。${details?.error ? `失败：${details.error}` : ""}` }];
+    }
+    if (!blocks) {
+        return [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) ?? "" }];
+    }
+    const content: Array<TextContent | ImageContent> = [];
+    for (const block of blocks) {
+        if (!isToolRecord(block)) {
+            continue;
+        }
+        if (block.type === "text" && typeof block.text === "string") {
+            content.push({ type: "text", text: block.text });
+        } else if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") {
+            content.push({ type: "image", data: block.data, mimeType: block.mimeType });
+        }
+    }
+    return content.length ? content : [{ type: "text", text: "工具未返回可还原的内容" }];
+}
 
 export interface StoredHistoryTurn {
     turn: { id?: number; turnNo?: number; executionJson?: ExecutionRecord | null };
@@ -40,12 +71,9 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
             if (!parsed.id || !parsed.tool) {
                 continue;
             }
-            const text = Array.isArray(parsed.result?.content)
-                ? parsed.result.content.map((block: any) => block.text || "").join("\n")
-                : typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result) ?? "";
             results.set(parsed.id, sourceMessage({
                 role: "toolResult", toolCallId: parsed.id, toolName: parsed.tool,
-                content: [{ type: "text", text }], isError: Boolean(parsed.isError),
+                content: restoreToolContent(parsed.result, parsed.tool), isError: Boolean(parsed.isError),
                 timestamp: saved.createdAt ? new Date(saved.createdAt).getTime() : 0
             }, parsed.attemptNo !== undefined && parsed.callNo !== undefined ? `t:${item.turn.id ?? 0}:a:${parsed.attemptNo}:c:${parsed.callNo}:tool:${parsed.id}` :
                 saved.id ? `m:${saved.id}` : `t:${item.turn.id ?? 0}:a:1:c:1:tool:${parsed.id}`,

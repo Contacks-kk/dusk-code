@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ImageContent } from "@mariozechner/pi-ai";
+import { isToolRecord } from "../agent/tools/result";
 
 const SUPPORTED_EXTENSIONS: Record<string, string> = {
     ".png": "image/png",
@@ -9,6 +10,14 @@ const SUPPORTED_EXTENSIONS: Record<string, string> = {
     ".webp": "image/webp",
     ".gif": "image/gif"
 };
+
+/** 为文字摘要和终端展示移除图片编码，保留格式与归档标记 */
+export function imageArchiveReplacer(_key: string, value: unknown): unknown {
+    if (isToolRecord(value) && value.type === "image" && typeof value.data === "string") {
+        return { type: "image", mimeType: value.mimeType, archived: true };
+    }
+    return value;
+}
 
 /** 根据文件扩展名获取图片的 MIME 类型 */
 export function getImageMimeType(filePath: string): string | null {

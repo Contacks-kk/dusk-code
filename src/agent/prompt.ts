@@ -8,6 +8,7 @@ const BASE_TOOLBOX_SPEC = `【工具箱分类与调用规范】
    - \`list_files\`: 发现并探索项目文件结构与目录树。
    - \`grep_search\`: 在全项目或指定目录下根据关键词/正则快速定位文件与行号。
    - \`read_file\`: 精准阅读指定文件的代码行切片。
+   - \`read_image\`: 读取本地截图，将图片本身送入模型检查界面；生成截图或输出文件名不代表已经看图。
    - \`git_status\`: 检查版本库工作区、暂存区与分支改动状态。
    - \`git_diff\`: 查看代码修改前后的详细差异比对。
    - \`activate_skill\`: 遇到专业领域任务时（如前端审美优化、代码审查、Bug修复、代码库阅读、头脑风暴等），按需激活加载技能的执行规约与工作流。
@@ -59,12 +60,13 @@ function buildWorkflowPolicy(mode: PermissionMode): string {
 export function buildSystemPrompt(options: {
     permissionMode?: PermissionMode;
     projectRoot?: string;
+    skillCatalog?: string;
 } = {}): string {
     const mode = options.permissionMode || "workspace";
     const workflow = buildWorkflowPolicy(mode);
 
     // 动态提取当前已注册的技能目录清单
-    const skillCatalog = skillRegistry.generatePromptCatalog();
+    const skillCatalog = options.skillCatalog ?? skillRegistry.generatePromptCatalog();
 
     return `你是一个具备完整工程工具调用能力的专业 Code Agent（编程智能体）。
 你可以使用本地核心工程工具协助用户进行代码探索、阅读、修改、测试与版本控制。

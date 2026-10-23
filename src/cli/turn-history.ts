@@ -1,3 +1,5 @@
+import type { ExecutionRecord } from "../agent/types";
+
 export interface ToolCallDetail {
     id: string;
     name: string;
@@ -8,6 +10,7 @@ export interface ToolCallDetail {
 }
 
 export interface TurnRecord {
+    execution?: ExecutionRecord;
     turnNo: number;
     thinkingText: string;
     thinkingDurationMs: number;
@@ -22,6 +25,11 @@ export class TurnHistoryManager {
     private turns: Map<number, TurnRecord> = new Map();
     private totalOutputLines = 0;
     private turnLineOffsets: Map<number, { startLine: number; thoughtLine?: number }> = new Map();
+
+    /** 保存该轮的持久化执行与技能使用记录 */
+    public recordExecution(turnNo: number, execution?: ExecutionRecord | null): void {
+        this.recordTurnStart(turnNo).execution = execution ?? undefined;
+    }
 
     /** 记录输出渲染增加的终端行数 */
     public recordOutputLines(lines: number): void {

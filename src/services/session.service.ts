@@ -1,8 +1,21 @@
 import { eq, desc, asc } from "drizzle-orm";
 import { db } from "../db";
 import { session, turn, message, type Session, type Turn, type Message } from "../db/schema";
+import { normalizeSkillState } from "../agent/skills/state";
+import type { SessionSkillState } from "../agent/skills/types";
 
 export class SessionService {
+    /** 保存当前会话的固定技能与禁用名单 */
+    public async saveSkillState(sessionId: number, state: SessionSkillState): Promise<void> {
+        const updated = db.update(session).set({
+            skillStateJson: normalizeSkillState(state),
+            updatedAt: new Date()
+        }).where(eq(session.id, sessionId)).returning({ id: session.id }).get();
+        if (!updated) {
+            throw new Error("会话不存在，无法保存技能状态");
+        }
+    }
+
     /** 创建新的对话会话并绑定所属工程 */
     public async createSession(title?: string, projectId?: number): Promise<Session> {
         const defaultTitle = title || "新对话";

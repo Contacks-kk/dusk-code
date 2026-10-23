@@ -2,7 +2,7 @@ import { getModels, type Model, type OpenAICompletionsCompat } from "@mariozechn
 import type { ReasoningEffort } from "./generation-policy";
 
 export type LlmProvider = "auto" | "deepseek" | "mimo" | "bailian" | "openai-compatible";
-export type RequestPurpose = "task" | "summary" | "title" | "recovery";
+export type RequestPurpose = "task" | "summary" | "title" | "recovery" | "skill_selection";
 export type ThinkingLevelMap = Partial<Record<ReasoningEffort | "minimal", string | null>>;
 
 export interface ModelOverride {
