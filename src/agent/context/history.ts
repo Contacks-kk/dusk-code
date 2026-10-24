@@ -118,6 +118,14 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
                 messages.push(structuredClone(results.get(block.id)!));
             }
         }
+        for (const internal of execution?.delivery?.continuations ?? []) {
+            if (internal.afterCall.attemptNo === source.attemptNo && internal.afterCall.callNo === source.callNo) {
+                const restored = { role: "runtime_control" as const, content: internal.message.content as string,
+                    timestamp: internal.message.timestamp, instructionRevision: internal.instructionRevision ?? 0 };
+                messages.push(sourceMessage(restored, `t:${item.turn.id ?? 0}:delivery:${internal.id}`,
+                    item.turn.id, item.turn.turnNo));
+            }
+        }
     }
     if (!linked && savedReply && !replyRestored) {
         const last = calls.at(-1)!.response;
@@ -125,6 +133,11 @@ export function restoreRecordedMessages(item: StoredHistoryTurn): AgentMessage[]
         messages.push(sourceMessage({ ...structuredClone(last), content: [{ type: "text", text: savedReply }],
             stopReason: item.turn.executionJson?.status === "completed" ? "stop" : "length" },
             saved?.id ? `m:${saved.id}` : `t:${item.turn.id ?? 0}:reply`, item.turn.id, item.turn.turnNo));
+    }
+    const report = execution?.delivery?.finalReport;
+    if (report) {
+        messages.push(sourceMessage({ ...structuredClone(calls.at(-1)!.response), content: [{ type: "text", text: report }], stopReason: "stop" },
+            `t:${item.turn.id ?? 0}:delivery:report`, item.turn.id, item.turn.turnNo));
     }
     return messages;
 }

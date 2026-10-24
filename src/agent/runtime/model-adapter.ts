@@ -45,10 +45,11 @@ export function finishRequestDiagnostics(diagnostics: RequestDiagnostics, respon
 export function prepareModelRequest(context: Context, profile: ResolvedModelCapabilities, purpose: RequestPurpose,
     requestedEffort: ReasoningEffort = "high", requestedMaxTokens = 32768, options: SimpleStreamOptions = {}) {
     const model = sdkModel(profile);
-    const requestedThinking = purpose === "task" ? requestedEffort : "off";
+    const taskThinking = ["task", "task_requirements", "acceptance_review"].includes(purpose);
+    const requestedThinking = taskThinking ? requestedEffort : "off";
     let effort: ReasoningEffort | undefined = requestedThinking;
     let downgrade: string | undefined;
-    if (purpose === "task") {
+    if (taskThinking) {
         validateEffort(profile, requestedThinking);
     } else if (!profile.reasoning) {
         effort = "off";

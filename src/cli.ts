@@ -1,4 +1,6 @@
 import * as fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { formatTaskStatus } from "./agent/acceptance/task-store";
 import { agentService } from "./services/agent.service";
 import { projectService } from "./services/project.service";
 import { sessionService } from "./services/session.service";
@@ -15,6 +17,7 @@ import { isPlanConfirmationPrompt, promptPlanConfirmation } from "./cli/plan-con
 import { skillRegistry } from "./agent/skills/registry";
 import { turnHistoryManager } from "./cli/turn-history";
 import type { AgentRunResult } from "./agent/types";
+import type { VerificationOptions } from "./agent/acceptance/types";
 
 /** 检测异常是否为 Ctrl+C 中断引发的取消错误 */
 function isAbortError(err: unknown): boolean {
@@ -33,6 +36,7 @@ function isAbortError(err: unknown): boolean {
 async function startCli(): Promise<void> {
     let currentSessionId: number | undefined;
     let activeController: AbortController | undefined;
+    let activeRun: { sessionId: number; runId: string } | undefined;
     let exitRequested = false;
 
     /** 取消活动任务，保存最终执行状态后退出 */
@@ -95,18 +99,29 @@ async function startCli(): Promise<void> {
     };
 
     /** 为所有 CLI 对话入口绑定统一取消控制器并开放执行态输入框 */
-    const chat = async (prompt: string, imagePaths?: string[]) => {
+    const chat = async (prompt: string, imagePaths?: string[], verification?: VerificationOptions) => {
         activeController = new AbortController();
 
         // 开放执行期输入框供用户键入
-        liveInputManager.start();
+        liveInputManager.start(async input => {
+            if (input.trim() === "/status") {
+                console.log("\n" + formatTaskStatus(agentService.status(currentSessionId)));
+                return;
+            }
+            if (!activeRun) {
+                throw new Error("活动运行尚未登记，请稍后提交");
+            }
+            await agentService.input(activeRun.sessionId, activeRun.runId, randomUUID(), input);
+        });
         rollingTicker.start();
 
         try {
-            // 调用 AgentService 执行对话链路
+            //* 调用 AgentService 执行对话链路
             return await agentService.chat(currentSessionId, prompt, {
+                onActive: value => { activeRun = value; },
                 projectId: currentProject.id,
                 imagePaths,
+                verification,
                 signal: activeController.signal,
                 onStep: renderLiveStep,
                 onAskPermission: askUserPermission
@@ -116,6 +131,7 @@ async function startCli(): Promise<void> {
             rollingTicker.flush();
             liveInputManager.stop();
             activeController = undefined;
+            activeRun = undefined;
         }
     };
 
@@ -132,7 +148,7 @@ async function startCli(): Promise<void> {
         renderAssistantReply(result.reply, result.status);
 
         // 2. 结算全链路耗时
-        renderCrunchedSummary(turnDurationMs);
+        renderCrunchedSummary(turnDurationMs, result.delivery?.status);
 
         // 3. 检查是否为 Agent 制定的方案并等待用户确认
         if (isPlanConfirmationPrompt(result.reply, isExplicitPlan)) {
@@ -246,6 +262,18 @@ async function startCli(): Promise<void> {
 
                 if (cmd === "/skill" || cmd === "/skills") {
                     await commandHandler.handleSkill(cmdArg, currentSessionId);
+                    continue;
+                }
+
+                if (cmd === "/verify") {
+                    const started = Date.now();
+                    const result = await chat("继续当前任务验收，只运行未通过项及受影响的核心回归，不修改源码。", undefined,
+                        { mode: "only", taskId: cmdArg?.trim() || undefined });
+                    await handleTurnCompletion(result, Date.now() - started);
+                    continue;
+                }
+                if (cmd === "/status") {
+                    renderAssistantReply(formatTaskStatus(agentService.status(currentSessionId)));
                     continue;
                 }
 

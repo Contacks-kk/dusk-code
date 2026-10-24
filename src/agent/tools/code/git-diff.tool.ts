@@ -3,6 +3,7 @@ import { Type } from "@sinclair/typebox";
 import { shellAdapter } from "../../runtime/shell-adapter";
 
 const gitDiffParams = Type.Object({
+    repoPath: Type.Optional(Type.String({ description: "仓库目录路径，默认为当前工程根目录" })),
     filePath: Type.Optional(Type.String({ description: "指定查看差异的文件路径，缺省时查看全局差异" })),
     staged: Type.Optional(Type.Boolean({ description: "是否查看已暂存区 (--staged) 的差异，默认为 false" }))
 });
@@ -25,7 +26,7 @@ export const gitDiffTool: AgentTool<typeof gitDiffParams> = {
             }
 
             const command = args.join(" ");
-            const result = await shellAdapter.execute(command, undefined, undefined, signal);
+            const result = await shellAdapter.execute(command, params.repoPath, undefined, signal);
 
             if (result.aborted || result.timedOut || result.exitCode !== 0) {
                 if (!result.aborted && !result.timedOut && result.stderr.includes("not a git repository")) {

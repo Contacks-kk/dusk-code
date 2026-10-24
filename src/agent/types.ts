@@ -2,6 +2,8 @@ import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ContextRecord } from "./context/types";
 import type { RequestDiagnostics } from "./runtime/model-adapter";
 import type { SkillExecutionRecord } from "./skills/types";
+import type { DeliveryRecord } from "./acceptance/types";
+import type { TurnControl } from "./runtime/turn-control";
 
 export type StepType = 
 "thought" | 
@@ -10,6 +12,7 @@ export type StepType =
 "tool_result" | 
 "answer" | 
 "status" | 
+"task_status" |
 "turn_start" | 
 "turn_end" | 
 "intermediate_text" | 
@@ -53,6 +56,7 @@ export interface GenerationUsage {
 }
 
 export interface GenerationCall {
+    instructionRevision?: number;
     diagnostics?: RequestDiagnostics;
     phase?: "streaming" | "finished";
     callNo: number;
@@ -83,6 +87,9 @@ export interface GenerationAttempt {
 }
 
 export interface ExecutionRecord {
+    control?: TurnControl;
+    taskStatus?: TaskStatus;
+    delivery?: DeliveryRecord;
     skills?: SkillExecutionRecord;
     auxiliaryRequests?: RequestDiagnostics[];
     context?: ContextRecord;
@@ -107,6 +114,8 @@ export interface ExecutionRecord {
 }
 
 export interface AgentExecutionStep {
+    instructionRevision?: number;
+    taskStatus?: TaskStatus;
     callNo?: number;
     type: StepType;
     content?: string;
@@ -122,9 +131,24 @@ export interface AgentExecutionStep {
     turnNo?: number;
 }
 
+export interface TaskStatus {
+    request: string;
+    runId: string;
+    sessionId: number;
+    taskId?: string;
+    goal: string;
+    intent: string;
+    phase: string;
+    instructionRevision: number;
+    counts: Partial<Record<import("./acceptance/types").CheckStatus, number>>;
+    remainingMs: number;
+    stoppedReason?: string;
+}
+
 import type { ResponseQuality, SalvagedContent } from "./runtime/response-salvager";
 
 export interface AgentRunResult {
+    delivery?: DeliveryRecord;
     sessionId: number;
     turnId: number;
     turnNo: number;

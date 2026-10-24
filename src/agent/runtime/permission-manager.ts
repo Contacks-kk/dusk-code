@@ -39,6 +39,20 @@ export const READ_TOOLS = new Set([
     "recall_context"
 ]);
 
+/** 按具体动作判断验收工具是否只观察已有资源 */
+export function isReadOnlyTool(name: string, args: Record<string, unknown> = {}): boolean {
+    if (name === "browser_action") {
+        return ["snapshot", "network", "console", "screenshot", "assert_visible", "assert_text", "assert_count", "assert_enabled", "assert_layout", "assert_response"].includes(String(args.action));
+    }
+    if (name === "managed_process") {
+        return ["logs", "ready", "port"].includes(String(args.action));
+    }
+    if (name === "test_mail") {
+        return args.action === "read";
+    }
+    return READ_TOOLS.has(name);
+}
+
 /** 统一权限与沙箱边界管理器 */
 export class PermissionManager {
     private currentMode: PermissionMode = "workspace";
@@ -78,10 +92,14 @@ export class PermissionManager {
     public async checkToolPermission(
         toolName: string,
         args: Record<string, any> = {},
-        askUserConfirm?: (prompt: string) => Promise<boolean>
+        askUserConfirm?: (prompt: string) => Promise<boolean>,
+        boundary: { workspaceRoot?: string; readRoots?: string[] } = {}
     ): Promise<PermissionCheckResult> {
         // 1. 只读模式下拦截所有写入与命令执行操作
         if (this.currentMode === "read-only") {
+            if (["browser_action", "managed_process", "test_mail"].includes(toolName) && !isReadOnlyTool(toolName, args)) {
+                return { allowed: false, reason: "只读模式禁止启动验收资源或执行浏览器交互" };
+            }
             if (WRITE_TOOLS.has(toolName)) {
                 return { allowed: false, reason: `当前处于 [Read Only] 只读模式，禁止执行文件写入/修改操作 [${toolName}]。可通过 /permissions workspace 解锁。` };
             }
@@ -97,10 +115,13 @@ export class PermissionManager {
         }
 
         // 3. Workspace 默认模式：执行沙箱与敏感边界保护
-        const cwd = process.cwd();
-        const targetPath = args.filePath || args.directoryPath || args.repoPath;
+        const cwd = boundary.workspaceRoot ?? process.cwd();
+        const targetPath = args.filePath || args.directoryPath || args.repoPath || args.searchPath;
 
         if (targetPath && typeof targetPath === "string") {
+            if (isReadOnlyTool(toolName, args) && boundary.readRoots?.some(root => !this.isPathEscaping(targetPath, root))) {
+                return { allowed: true };
+            }
             // 敏感文件保护
             if (this.isSensitiveFile(targetPath)) {
                 if (WRITE_TOOLS.has(toolName)) {

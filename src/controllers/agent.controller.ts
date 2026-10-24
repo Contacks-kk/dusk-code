@@ -1,7 +1,23 @@
 import type { Request, Response } from "express";
 import { agentService } from "../services/agent.service";
+import { parseVerificationOptions } from "../agent/acceptance/requirements";
 
 export class AgentController {
+    /** 把新要求交给活动运行，重复请求只接收一次 */
+    public async input(req: Request, res: Response): Promise<void> {
+        const { sessionId, runId, inputId, message } = req.body ?? {};
+        if (!Number.isSafeInteger(sessionId) || sessionId <= 0 || typeof runId !== "string" || !runId ||
+            typeof inputId !== "string" || !inputId || inputId.length > 128 || typeof message !== "string" || !message.trim()) {
+            res.status(400).json({ error: "需要合法的 sessionId、runId、inputId 和非空 message" });
+            return;
+        }
+        try {
+            res.status(202).json(await agentService.input(sessionId, runId, inputId, message));
+        } catch (error) {
+            const failure = error as Error & { statusCode?: number };
+            res.status(failure.statusCode ?? 500).json({ error: failure.message });
+        }
+    }
     /** 处理用户对话请求并运行 Agent Loop 交互接口 */
     public async chat(req: Request, res: Response): Promise<void> {
         const controller = new AbortController();
@@ -16,7 +32,8 @@ export class AgentController {
             }
 
             const sessionId = req.body.sessionId !== undefined ? Number(req.body.sessionId) : undefined;
-            const result = await agentService.chat(sessionId, userInput, { signal: controller.signal });
+            const verification = parseVerificationOptions(req.body.verification);
+            const result = await agentService.chat(sessionId, userInput, { signal: controller.signal, verification });
 
             if (!res.destroyed) res.json({ data: result });
         } catch (error: any) {
@@ -41,6 +58,7 @@ export class AgentController {
 
             const rawSessionId = req.body?.sessionId ?? req.query?.sessionId;
             const sessionId = rawSessionId !== undefined ? Number(rawSessionId) : undefined;
+            const verification = parseVerificationOptions(req.body?.verification ?? req.query?.verification);
 
             // 建立标准 SSE 传输连接
             res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -50,13 +68,24 @@ export class AgentController {
 
             // 驱动 Agent Loop 并将每一步生命周期事件实时写入 SSE 流
             const result = await agentService.chat(sessionId, userInput, {
+                onActive: value => {
+                    if (!res.destroyed) {
+                        res.write(`data: ${JSON.stringify({ type: "active", ...value })}\n\n`);
+                    }
+                },
                 signal: controller.signal,
+                verification,
                 onStep: step => { if (!res.destroyed) res.write(`data: ${JSON.stringify({ type: "step", step })}\n\n`); }
             });
 
             // 推送最终完成信号与整体载荷
             if (!res.destroyed) {
-                res.write(`data: ${JSON.stringify({ type: "done", data: result })}\n\n`);
+                res.write(`data: ${JSON.stringify({
+                    type: "done",
+                    executionStatus: result.status,
+                    deliveryStatus: result.delivery?.status,
+                    data: result
+                })}\n\n`);
                 res.end();
             }
         } catch (error: any) {

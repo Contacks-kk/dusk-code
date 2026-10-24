@@ -151,8 +151,10 @@ export class SkillRuntime {
 
     /** 设置当前任务的视觉验收要求 */
     requireVisual(required: boolean): void {
-        this.record.needsVisualVerification = required;
-        this.record.visual = { status: required ? "pending" : "not_required" };
+        if (required && !this.record.needsVisualVerification) {
+            this.record.needsVisualVerification = true;
+            this.record.visual = { status: "pending" };
+        }
     }
 
     /** 生成每次请求都保留的完整技能指令 */

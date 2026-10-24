@@ -2,6 +2,7 @@ import * as readline from "node:readline";
 import { colors } from "./theme";
 import { mouseTracker } from "./mouse-tracker";
 import { interactivePrompt } from "./interactive-prompt";
+import { isAwaitingPlanConfirmation } from "../agent/runtime/plan-intent";
 
 export type PlanAction = "confirm" | "supplement" | "cancel";
 
@@ -20,18 +21,7 @@ export function isPlanConfirmationPrompt(reply: string, isExplicitPlan = false):
         return true;
     }
 
-    const keywords = [
-        "请问是否确认执行",
-        "是否确认执行",
-        "确认执行该修改",
-        "是否同意执行",
-        "请确认是否执行",
-        "是否确认开始执行",
-        "请确认是否开始修改",
-        "是否确认继续"
-    ];
-
-    return keywords.some((kw) => reply.includes(kw));
+    return isAwaitingPlanConfirmation(reply);
 }
 
 /** 弹出置于底部的方案确认弹窗，支持上下键选择确定或补充 */

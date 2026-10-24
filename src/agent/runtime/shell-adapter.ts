@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import * as path from "node:path";
+import * as fs from "node:fs";
 
 export interface CommandExecutionResult {
     stdout: string;
@@ -14,8 +15,36 @@ export interface CommandExecutionResult {
 export class ShellAdapter {
     private isWindows = process.platform === "win32";
 
+    /** 优先使用新版 PowerShell，保留原生命令退出码并单独处理 Shell 异常 */
+    private windowsInvocation(command: string): { program: string; args: string[] } {
+        const modern = path.join(process.env.ProgramFiles ?? "C:\\Program Files", "PowerShell", "7", "pwsh.exe");
+        const installed = [modern, ...(process.env.PATH ?? "").split(path.delimiter).map(directory => path.join(directory, "pwsh.exe"))]
+            .find(filename => fs.existsSync(filename));
+        const script = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+$global:LASTEXITCODE = $null;
+try {
+    & { ${command}
+    };
+    $duskShellSucceeded = $?;
+    if ($null -ne $global:LASTEXITCODE) {
+        exit $global:LASTEXITCODE;
+    };
+    if (-not $duskShellSucceeded) {
+        exit 1;
+    };
+    exit 0;
+} catch {
+    [Console]::Error.WriteLine($_.ToString());
+    exit 1;
+}`;
+        return {
+            program: installed ?? "powershell.exe",
+            args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        };
+    }
+
     /** 检查命令是否包含高危禁止操作 */
-    private validateCommandSafety(command: string): void {
+    public validateCommandSafety(command: string): void {
         const dangerousPatterns = [
             /rm\s+-rf\s+[\/\*]/i,
             /Remove-Item\s+.*-Recurse/i,
@@ -69,15 +98,9 @@ export class ShellAdapter {
 
             if (this.isWindows) {
                 // Windows 环境下强制启用 PowerShell 并指定 UTF-8 编码
-                shellProgram = "powershell.exe";
-                shellArgs = [
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}`
-                ];
+                const invocation = this.windowsInvocation(command);
+                shellProgram = invocation.program;
+                shellArgs = invocation.args;
             } else {
                 // Unix/Linux/macOS 环境下使用 sh
                 shellProgram = "/bin/sh";
@@ -86,7 +109,8 @@ export class ShellAdapter {
 
             const proc = spawn(shellProgram, shellArgs, {
                 cwd: targetCwd,
-                env: { ...process.env, LANG: "zh_CN.UTF-8" }
+                env: { ...process.env, LANG: "zh_CN.UTF-8" },
+                windowsHide: true
             });
 
             let stdout = "";

@@ -38,6 +38,7 @@ export class CommandHandler {
         const execution = history.at(-1)?.turn.executionJson;
         if (execution) {
             console.log(`${colors.gray}上一轮状态: ${execution.status}，共 ${execution.attempts.length} 次尝试${colors.reset}\n`);
+            console.log(`验收状态：${execution.delivery?.status ?? "无验收记录"}${execution.delivery?.stoppedReason ? `；${execution.delivery.stoppedReason}` : ""}\n`);
         }
     }
 

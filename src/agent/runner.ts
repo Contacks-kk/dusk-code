@@ -1,8 +1,9 @@
 import { Agent, type AgentMessage, type AgentTool, type StreamFn } from "@mariozechner/pi-agent-core";
+import * as path from "node:path";
 import { createAssistantMessageEventStream, streamSimple, type AssistantMessage, type ImageContent } from "@mariozechner/pi-ai";
 import type { AgentExecutionStep, ExecutionRecord, GenerationAttempt, GenerationCall, GenerationUsage, RunStatus } from "./types";
 import { toolRegistry } from "./tools/registry";
-import { permissionManager, READ_TOOLS } from "./runtime/permission-manager";
+import { permissionManager, isReadOnlyTool } from "./runtime/permission-manager";
 import { generationPolicy, type GenerationPolicy, type ReasoningEffort } from "./runtime/generation-policy";
 import { ContextCoordinator } from "./context/coordinator";
 import { sourceMessage, type ContextMessage, type ContextPersistence } from "./context/types";
@@ -10,7 +11,9 @@ import { historyToolId, restoreRecordedMessages } from "./context/history";
 import { finishRequestDiagnostics, prepareModelRequest, type RequestDiagnostics } from "./runtime/model-adapter";
 import { resolveModelCapabilities, sdkModel, type ResolvedModelCapabilities } from "./runtime/model-profile";
 import type { SkillRuntime } from "./skills/runtime";
-import { isManagedToolFailure } from "./tools/result";
+import type { AcceptanceRuntime } from "./acceptance/runtime";
+import { isManagedToolFailure, isToolRecord } from "./tools/result";
+import { controlPrompt, controlToolRejection, withoutRuntimeControl, type TurnControl } from "./runtime/turn-control";
 import { salvageResponse, composeReply, composeIncompleteReport, type ResponseQuality, type SalvagedContent } from "./runtime/response-salvager";
 import {
     detectTruncationStage,
@@ -19,7 +22,10 @@ import {
 } from "./runtime/truncation-recovery";
 
 export interface RunnerOptions extends Partial<GenerationPolicy> {
+    control?: TurnControl;
+    beforeAction?: () => Promise<void>;
     skillRuntime?: SkillRuntime;
+    acceptance?: AcceptanceRuntime;
     auxiliaryRequests?: RequestDiagnostics[];
     baseUrl: string;
     model: string;
@@ -33,6 +39,7 @@ export interface RunnerOptions extends Partial<GenerationPolicy> {
     currentTurnNo?: number;
     userMessageId?: number;
     systemPrompt?: string;
+    projectRoot?: string;
     initialMessages?: AgentMessage[];
     tools?: AgentTool<any>[];
     onStep?: (step: AgentExecutionStep) => void;
@@ -83,6 +90,33 @@ export class AgentRunner {
     private contextCoordinator?: ContextCoordinator;
     private imageInputUnavailable = false;
 
+    /** 让文件和命令工具使用目标项目目录，权限检查与实际操作采用相同路径 */
+    private projectArguments(name: string, args: unknown): unknown {
+        if (!this.options.projectRoot || !isToolRecord(args)) {
+            return args;
+        }
+        const fields: Record<string, string> = {
+            read_file: "filePath",
+            read_image: "filePath",
+            write_file: "filePath",
+            apply_patch: "filePath",
+            list_files: "directoryPath",
+            grep_search: "searchPath",
+            git_status: "repoPath",
+            git_diff: "repoPath",
+            execute_command: "cwd"
+        };
+        const field = fields[name];
+        if (!field) {
+            return args;
+        }
+        const value = args[field];
+        if ((value !== undefined && typeof value !== "string") || (value === undefined && field === "filePath")) {
+            return args;
+        }
+        return { ...args, [field]: typeof value === "string" ? path.resolve(this.options.projectRoot, value) : this.options.projectRoot };
+    }
+
     /** 保存本轮模型连接与生成策略 */
     constructor(private readonly options: RunnerOptions) {
         this.policy = generationPolicy(options, options.model);
@@ -103,7 +137,7 @@ export class AgentRunner {
      */
     private emit(step: Omit<AgentExecutionStep, "timestamp">): void {
         // 新建对象，浅拷贝step字段值，并且补齐timestamp字段值
-        const event = { ...step, timestamp: Date.now() };
+        const event = { instructionRevision: this.options.control?.instructionRevision, ...step, timestamp: Date.now() };
         // 将事件推入steps中
         this.steps.push(event);
         // 回调onStep函数
@@ -118,6 +152,7 @@ export class AgentRunner {
 
     /** 将无法送达的图片替换为说明，原始消息仍保留在归档中 */
     private requestMessages(messages: AgentMessage[]): AgentMessage[] {
+        messages = withoutRuntimeControl(messages);
         if (!this.imageInputUnavailable) {
             return messages;
         }
@@ -126,7 +161,7 @@ export class AgentRunner {
 
     /** 为仅接受文字的请求保留消息身份并替换图片块 */
     private messageWithoutImages(message: AgentMessage): AgentMessage {
-        if (message.role === "assistant" || typeof message.content === "string") {
+        if (message.role === "assistant" || message.role === "runtime_control" || typeof message.content === "string") {
             return message;
         }
         return {
@@ -145,7 +180,9 @@ export class AgentRunner {
         }
         while (true) {
             signal?.throwIfAborted();
-            const systemPrompt = this.systemPrompt + (this.options.skillRuntime?.prompt() ?? "");
+            await this.options.beforeAction?.();
+            const systemPrompt = this.systemPrompt + (this.options.skillRuntime?.prompt() ?? "") + (this.options.acceptance?.prompt() ?? "") +
+                (this.options.control ? controlPrompt(this.options.control) : "");
             coordinator.setSystemPrompt(systemPrompt);
             try {
                 const fitted = await coordinator.prepare(messages, outputBudget, signal, force);
@@ -194,11 +231,17 @@ export class AgentRunner {
         /** 在实际工具调用前记录可能发生的副作用 */
         const tools = this.tools.map(tool => ({
             ...tool,
+            prepareArguments: (args: unknown) => this.projectArguments(tool.name, tool.prepareArguments ? tool.prepareArguments(args) : args),
             execute: async (...args: Parameters<typeof tool.execute>) => {
+                await this.options.beforeAction?.();
                 if (args[2]?.aborted || this.options.signal?.aborted || originalLength || this.persistenceError) {
                     throw new Error("生成已终止，禁止执行工具");
                 }
-                if (!READ_TOOLS.has(tool.name)) {
+                const boundary = this.options.control && controlToolRejection(this.options.control, tool.name, args[1] as Record<string, unknown>);
+                if (boundary) {
+                    throw new Error(boundary);
+                }
+                if (!isReadOnlyTool(tool.name, args[1] as Record<string, unknown>)) {
                     summary.sideEffectStarted = true;
                     const call = summary.calls.at(-1);
                     if (call) {
@@ -239,6 +282,7 @@ export class AgentRunner {
             let partial: AssistantMessage | undefined;
             let dirty = false;
             const call: GenerationCall = {
+                instructionRevision: this.options.control?.instructionRevision,
                 phase: "streaming",
                 callNo: summary.calls.length + 1,
                 maxTokens: summary.maxTokens,
@@ -328,7 +372,7 @@ export class AgentRunner {
                     if (this.policy.generationTimeoutMs) timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.policy.generationTimeoutMs);
                     let overflowRetried = false;
                     for (let requestAttempt = 0; requestAttempt < 3; requestAttempt++) {
-                        const request = prepareModelRequest({ ...context, systemPrompt: prepared.systemPrompt, messages: prepared.messages }, this.capabilities,
+                        const request = prepareModelRequest({ ...context, systemPrompt: prepared.systemPrompt, messages: withoutRuntimeControl(prepared.messages) }, this.capabilities,
                             summary.attemptNo === 1 ? "task" : "recovery", effort, summary.maxTokens, {
                                 ...options,
                                 apiKey: this.options.apiKey,
@@ -455,6 +499,7 @@ export class AgentRunner {
             return stream;
         };
         agent = new Agent({
+            convertToLlm: withoutRuntimeControl,
             initialState: { systemPrompt: this.systemPrompt, model, tools, messages: history, thinkingLevel: effort },
             getApiKey: () => this.options.apiKey, streamFn,
             /** 让工具失败标记在实时消息、检查点和历史回放中保持一致 */
@@ -465,6 +510,7 @@ export class AgentRunner {
                 return undefined;
             },
             beforeToolCall: async context => {
+                await this.options.beforeAction?.();
                 if (this.persistenceError) {
                     agent.abort();
                     return { block: true, reason: this.persistenceError };
@@ -473,13 +519,24 @@ export class AgentRunner {
                 if (originalLength || context.assistantMessage.stopReason === "length") {
                     return { block: true, reason: "工具调用来自被截断的生成，已阻止执行" };
                 }
-                const check = await permissionManager.checkToolPermission(context.toolCall.name, context.args as Record<string, any>, this.options.onAskPermission);
+                const rejection = (this.options.control && controlToolRejection(this.options.control, context.toolCall.name, context.args as Record<string, unknown>)) ??
+                    this.options.acceptance?.beforeTool(context.toolCall.name);
+                if (rejection) {
+                    return { block: true, reason: rejection };
+                }
+                const check = await permissionManager.checkToolPermission(context.toolCall.name, context.args as Record<string, unknown>, this.options.onAskPermission, {
+                    workspaceRoot: this.options.projectRoot,
+                    readRoots: [
+                        ...(this.options.acceptance ? [this.options.acceptance.evidence.directory] : []),
+                        ...(this.options.skillRuntime?.record.snapshots.filter(item => item.status === "loaded").map(item => item.skillDir) ?? [])
+                    ]
+                });
                 return check.allowed ? undefined : { block: true, reason: check.reason ?? "权限不足" };
             }
         });
         let currentTurnNo = 1;
         let thinkingStart = 0;
-        agent.subscribe(event => {
+        agent.subscribe(async event => {
             if (event.type === "turn_start") {
                 this.emit({
                     type: "turn_start",
@@ -538,6 +595,7 @@ export class AgentRunner {
             } else if (event.type === "tool_execution_start") {
                 starts.set(event.toolCallId, Date.now());
                 toolSteps.set(event.toolCallId, {
+                    instructionRevision: summary.calls.at(-1)?.instructionRevision,
                     type: "tool_call", attemptNo: summary.attemptNo, callNo: summary.calls.at(-1)?.callNo,
                     turnNo: currentTurnNo, toolName: event.toolName, toolCallId: event.toolCallId,
                     args: event.args, timestamp: Date.now()
@@ -554,6 +612,7 @@ export class AgentRunner {
             } else if (event.type === "tool_execution_end") {
                 this.options.skillRuntime?.observeTool(event.toolName, toolSteps.get(event.toolCallId)?.args ?? {}, event.result, event.toolCallId, event.isError);
                 const resultStep: AgentExecutionStep = {
+                    instructionRevision: toolSteps.get(event.toolCallId)?.instructionRevision ?? this.options.control?.instructionRevision,
                     type: "tool_result",
                     attemptNo: summary.attemptNo,
                     callNo: summary.calls.at(-1)?.callNo,
@@ -570,6 +629,10 @@ export class AgentRunner {
                 /** 工具结果先落库，再允许循环发起下一次请求 */
                 onCallCompleted([toolSteps.get(event.toolCallId)!, resultStep]);
                 starts.delete(event.toolCallId);
+                if (!event.isError) {
+                    await this.options.acceptance?.observeTool(event.toolName, toolSteps.get(event.toolCallId)?.args ?? {});
+                    onCallCompleted();
+                }
             } else if (event.type === "turn_end") {
                 this.emit({
                     type: "turn_end",
@@ -577,6 +640,24 @@ export class AgentRunner {
                     turnNo: currentTurnNo
                 });
                 currentTurnNo++;
+                const call = summary.calls.at(-1);
+                if (event.message.role === "assistant" && event.message.stopReason === "stop" && call?.status === "completed" && !originalLength &&
+                    !this.persistenceError && !execution.pendingToolCallIds.length && !this.options.signal?.aborted) {
+                    await this.options.beforeAction?.();
+                    let revision: number | undefined;
+                    let followUp: AgentMessage | undefined;
+                    do {
+                        revision = this.options.control?.instructionRevision;
+                        followUp = await this.options.acceptance?.candidate({ attemptNo: summary.attemptNo, callNo: call.callNo }, textOf(event.message));
+                        await this.options.beforeAction?.();
+                    } while (!this.options.signal?.aborted && revision !== this.options.control?.instructionRevision);
+
+                    // 续修指令先落库，再交给同一个 Agent 继续执行
+                    onCallCompleted();
+                    if (followUp && !this.options.signal?.aborted && revision === this.options.control?.instructionRevision) {
+                        agent.followUp(followUp);
+                    }
+                }
             }
         });
         /** 将外部取消信号传递到活动模型请求和工具循环 */
@@ -630,7 +711,9 @@ export class AgentRunner {
         const initialRequest = prepareModelRequest({ messages: [] }, this.capabilities, "task",
             this.options.reasoningEffort ?? "high", this.policy.maxTokens).diagnostics;
         const execution: ExecutionRecord = {
+            control: this.options.control,
             skills: this.options.skillRuntime?.record,
+            delivery: this.options.acceptance?.record,
             auxiliaryRequests: this.options.auxiliaryRequests,
             phase: "running", status: "failed", effectiveCallRefs: [], pendingToolCallIds: [],
             config: {
@@ -684,8 +767,13 @@ export class AgentRunner {
             };
             execution.attempts.push(summary);
             execution.phase = "running";
-            try { persistExecution(); }
-            catch { contextError = this.persistenceError; break; }
+            try {
+                persistExecution();
+            }
+            catch { 
+                contextError = this.persistenceError; 
+                break; 
+            }
             const history = summary.attemptNo === 1 ? this.options.initialMessages ?? [] :
                 [...this.options.initialMessages ?? [], this.originalUser, ...currentMessages()];
 
@@ -767,13 +855,30 @@ export class AgentRunner {
             finalSalvaged.hasUsableContent = true;
             if (execution.status !== "completed") finalSalvaged.quality = "partial_text";
         }
-        const reply = this.persistenceError
+        let reply = this.persistenceError
             ? (modelReply ? modelReply + "\n\n" : "") + "⚠️ " + this.persistenceError + "，已停止后续请求与工具执行。"
             : execution.status === "completed" ? modelReply
                 : execution.status === "truncated" && execution.recoverySteps.length
                     ? composeIncompleteReport(finalSalvaged, last, execution.recoverySteps.length, last?.recoveryStage) +
                     (contextError ? "\n" + contextError : "")
                     : composeReply(finalSalvaged, execution.status, last, execution.error, this.policy.generationTimeoutMs);
+        if (execution.delivery && execution.status !== "completed") {
+            execution.delivery.stoppedReason ??= execution.error ?? `本轮生成执行状态：${execution.status}，验收未完成`;
+        }
+        reply = this.options.acceptance?.finish(execution.status, reply) ?? reply;
+        if (!this.persistenceError) {
+            try {
+                persistExecution();
+            } catch {
+                execution.status = "failed";
+                execution.error = this.persistenceError;
+                if (execution.delivery?.status === "passed") {
+                    execution.delivery.status = "unverified";
+                    execution.delivery.stoppedReason = this.persistenceError;
+                    reply = this.options.acceptance?.finish("failed", reply) ?? reply;
+                }
+            }
+        }
         return {
             reply, modelReply, steps: [...this.steps], contextSteps: settledSteps,
             newMessages: [this.originalUser, ...currentMessages()],

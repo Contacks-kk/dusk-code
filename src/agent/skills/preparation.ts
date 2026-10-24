@@ -14,6 +14,8 @@ interface SkillPreparation {
     onStatus?: (text: string) => void;
     onDiagnostics: (diagnostics: RequestDiagnostics) => void;
     signal?: AbortSignal;
+    outputs?: string[];
+    visualRequired?: boolean;
 }
 
 /** 提取最近任务和方案，供简短确认消息沿用原有任务语境 */
@@ -45,9 +47,9 @@ async function loadAutomaticSkills(runtime: SkillRuntime, options: SkillPreparat
     options.onStatus?.("正在根据当前任务选择技能。");
     try {
         const selection = await selectSkills(options.userInput, recentSkillContext(options.history), catalog,
-            runtime.state, options.modelConfig, options.onDiagnostics, options.signal);
-        runtime.record.selection = { status: "completed", skills: selection.skills };
-        runtime.requireVisual(selection.needsVisualVerification);
+            runtime.state, options.modelConfig, options.onDiagnostics, options.signal, options.outputs);
+        runtime.record.selection = { status: "completed", skills: selection.skills, coverage: selection.coverage };
+        runtime.requireVisual(options.visualRequired ?? selection.needsVisualVerification);
         for (const selected of selection.skills) {
             await runtime.loadOptional(selected.name, "auto", selected.reason);
         }

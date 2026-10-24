@@ -175,6 +175,11 @@ ${colors.cyan}──────────────────────
                 value: "tools",
                 hint: `${turn.toolCalls.length} 个工具调用`
             });
+            items.push({
+                label: "查看任务验收与续修证据",
+                value: "delivery",
+                hint: turn.execution?.delivery?.status ?? "无验收记录"
+            });
 
             items.push({
                 label: "↩ 返回执行记录列表",
@@ -207,8 +212,29 @@ ${colors.magenta}╰────────────────────
             } else if (choice === "skills") {
                 this.showSkills(turn);
                 await this.waitForKey("按任意键返回执行详情...");
+            } else if (choice === "delivery") {
+                this.showDelivery(turn);
+                await this.waitForKey("按任意键返回执行详情...");
             }
         }
+    }
+
+    /** 展示实际验收结果，旧执行记录不追溯认定为通过 */
+    private showDelivery(turn: TurnRecord): void {
+        const delivery = turn.execution?.delivery;
+        if (!delivery) {
+            console.log("\n无验收记录\n");
+            return;
+        }
+        console.log(`\n任务 ${delivery.taskId}；验收 ${delivery.status}；续修 ${delivery.repairRounds}/3`);
+        console.log(`要求版本 ${delivery.contract.version}；停止原因：${delivery.stoppedReason ?? "无"}`);
+        for (const check of delivery.contract.checks) {
+            console.log(`${check.id} [${check.status}] ${check.title}${check.required ? "（必验）" : ""}：${check.feedback ?? check.expected}`);
+        }
+        for (const proof of delivery.evidence) {
+            console.log(`${proof.checkId} ${proof.kind} ${proof.success ? "证据支持通过" : "证据显示未通过"}；源码 ${proof.codeHash}；证据 ${proof.artifactPath}；SHA256 ${proof.hash}`);
+        }
+        console.log(`内部续修指令 ${delivery.continuations.length} 条；要求变更：${JSON.stringify(delivery.contract.changes)}`);
     }
 
     /** 展示技能选择、真实操作与视觉反馈证据 */
@@ -220,6 +246,9 @@ ${colors.magenta}╰────────────────────
         console.log(`\n技能选择：${record.selection.status}${record.selection.error ? `；失败：${record.selection.error}` : ""}`);
         for (const selected of record.selection.skills) {
             console.log(`自动选择 ${selected.name}：${selected.reason}`);
+        }
+        for (const item of record.selection.coverage ?? []) {
+            console.log(`产出 ${item.output}：${item.skills.join("、") || item.reason}`);
         }
         for (const snapshot of record.snapshots) {
             console.log(`\n${snapshot.name}：${snapshot.status === "loaded" ? "正文已加载" : "预算不足未加载"} [${snapshot.origin}/${snapshot.source}]`);

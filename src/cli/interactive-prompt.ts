@@ -14,6 +14,7 @@ export interface CommandOption {
 }
 
 export const SLASH_COMMANDS: CommandOption[] = [
+    { name: "/verify", description: "继续当前会话最近的未完成验收，可指定任务 ID" },
     { name: "/image", description: "视图输入：自动提取剪贴板截图或加载拖拽图片进行视觉分析", requiresArg: true },
     { name: "/model", description: "模型调节：上下键切换模型与推理思考等级 (Reasoning Effort)" },
     { name: "/plan", description: "规划模式：深入只读调研代码并输出实施方案", requiresArg: true },

@@ -4,6 +4,7 @@ import { finishRequestDiagnostics, prepareModelRequest, requestErrorMessage, typ
 import { requestTokens } from "../context/token";
 import type { SessionSkillState, SkillItem, SkillSelection } from "./types";
 import { isToolRecord } from "../tools/result";
+import { missingSkillCoverage, supplementSkillCoverage } from "./coverage";
 
 interface SelectionTask {
     input: string;
@@ -13,9 +14,10 @@ interface SelectionTask {
     config: ModelConfig;
     onDiagnostics: (diagnostics: RequestDiagnostics) => void;
     signal?: AbortSignal;
+    outputs: string[];
 }
 
-type SelectionAttempt = { success: true; selection: SkillSelection } | { success: false; reason: string };
+type SelectionAttempt = { success: true; selection: SkillSelection } | { success: false; reason: string; selection?: SkillSelection };
 const SELECTION_TIMEOUT_MS = 20000;
 const SELECTION_OUTPUT_TOKENS = 2048;
 const SELECTION_ATTEMPTS = 2;
@@ -62,7 +64,8 @@ function selectionContext(task: SelectionTask, repair: string): Context {
                 recentContext: task.recentContext,
                 pinned: task.state.pinned,
                 disabled: task.state.disabled,
-                catalog: task.catalog.map(item => ({ name: item.name, description: item.description }))
+                outputs: task.outputs,
+                catalog: task.catalog.map(item => ({ name: item.name, description: item.description, tags: item.metadata.tags }))
             }),
             timestamp: 0
         }]
@@ -72,7 +75,12 @@ function selectionContext(task: SelectionTask, repair: string): Context {
 /** 将格式校验失败转换为可纠正一次的选择结果 */
 function validateSelection(text: string, task: SelectionTask): SelectionAttempt {
     try {
-        return { success: true, selection: parseSkillSelection(text, task.catalog, task.state) };
+        const selection = parseSkillSelection(text, task.catalog, task.state);
+        const missing = missingSkillCoverage(selection, task.catalog, task.outputs, task.state.disabled, task.state.pinned);
+        if (missing.length) {
+            return { success: false, reason: `未覆盖专业产出：${missing.join("、")}`, selection };
+        }
+        return { success: true, selection };
     } catch (error) {
         return { success: false, reason: requestErrorMessage(error, task.config.apiKey) };
     }
@@ -123,7 +131,7 @@ async function requestSelection(task: SelectionTask, repair: string): Promise<Se
 
 /** 使用当前配置选择技能，格式无效时仅修复一次 */
 export async function selectSkills(input: string, recentContext: string, catalog: SkillItem[], state: SessionSkillState,
-    config: ModelConfig, onDiagnostics: (diagnostics: RequestDiagnostics) => void, signal?: AbortSignal): Promise<SkillSelection> {
+    config: ModelConfig, onDiagnostics: (diagnostics: RequestDiagnostics) => void, signal?: AbortSignal, outputs: string[] = []): Promise<SkillSelection> {
     const task: SelectionTask = {
         input,
         recentContext,
@@ -131,18 +139,22 @@ export async function selectSkills(input: string, recentContext: string, catalog
         state,
         config,
         onDiagnostics,
-        signal
+        signal,
+        outputs
     };
     let repair = "";
     for (let attempt = 0; attempt < SELECTION_ATTEMPTS; attempt++) {
         const result = await requestSelection(task, repair);
         if (result.success === true) {
-            return result.selection;
+            return supplementSkillCoverage(result.selection, catalog, outputs, state.disabled, state.pinned);
         }
         if (attempt === SELECTION_ATTEMPTS - 1) {
+            if (result.selection) {
+                return supplementSkillCoverage(result.selection, catalog, outputs, state.disabled, state.pinned);
+            }
             throw new Error(result.reason);
         }
-        repair = `\n上次选择格式或名称无效：${result.reason}。请严格按指定 JSON 结构和候选目录重新选择。`;
+        repair = `\n上次选择格式或产出覆盖无效：${result.reason}。请按指定 JSON 结构和候选目录补齐产出覆盖。`;
     }
     throw new Error("技能选择未返回有效结果");
 }

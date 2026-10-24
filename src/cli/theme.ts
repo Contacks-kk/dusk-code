@@ -5,6 +5,7 @@ import { reasoningLabel } from "../agent/runtime/generation-policy";
 import { renderMarkdown } from "./markdown";
 import { imageArchiveReplacer } from "../utils/image";
 import { getTerminalWidth, wrapTerminalText } from "./terminal-layout";
+import { liveInputManager } from "./live-input";
 
 export const colors = {
     reset: "\x1b[0m",
@@ -212,17 +213,22 @@ export function renderThought(durationMs: number, turnNo = 1): void {
 }
 
 /** 渲染单轮从用户输入到 Assistant 输出截止的全链路耗时总结 */
-export function renderCrunchedSummary(totalMs: number): void {
+export function renderCrunchedSummary(totalMs: number, deliveryStatus?: string): void {
     rollingTicker.flush();
     turnHistoryManager.recordOutputLines(3);
-    console.log(`\n${colors.cyan}✻ Completed in ${formatDuration(totalMs)} (本轮耗时: ${formatDuration(totalMs)})${colors.reset}\n`);
+    const label = deliveryStatus === "passed" ? "验收通过" : deliveryStatus && deliveryStatus !== "not_required" ? "本轮执行结束，验收未完成" : "本轮执行结束";
+    console.log(`\n${colors.cyan}✻ ${label} (本轮耗时: ${formatDuration(totalMs)})${colors.reset}\n`);
 }
 
 /** 渲染思考、工具和中间回复，隐藏内部循环编号 */
 export function renderLiveStep(step: AgentExecutionStep): void {
     const turnNo = step.turnNo ?? 1;
 
-    if (step.type === "turn_start") {
+    if (step.type === "task_status" && step.taskStatus) {
+        const state = step.taskStatus;
+        const phases = { routing: "识别要求", pending: "实现", verifying: "验收", repairing: "续修", not_required: "处理要求", finished: "结束" };
+        liveInputManager.setTaskStatus(`本轮 ${state.request.slice(0, 24)} · ${phases[state.phase] ?? state.phase} · 通过 ${state.counts.passed ?? 0} · 待评审 ${state.counts.awaiting_review ?? 0} · 剩余 ${formatDuration(state.remainingMs)}`);
+    } else if (step.type === "turn_start") {
         rollingTicker.setStage("正在等待模型响应");
         turnHistoryManager.recordTurnStart(turnNo);
     } else if (step.type === "thinking_delta") {
@@ -352,6 +358,7 @@ ${colors.cyan}${colors.bold}DUSK CLI 命令指引${colors.reset}
   ${colors.yellow}/plan <任务需求>${colors.reset}        显式进入规划模式，深入只读调研代码并输出实施计划
   ${colors.yellow}/skill [name]${colors.reset}           查看技能；指定名称后固定到当前会话
   ${colors.yellow}/skill off <name> | clear${colors.reset}  关闭技能，或清除手动设置并恢复自动选择
+  ${colors.yellow}/verify [taskId]${colors.reset}        继续最近未完成的验收，保留实际证据与缺口
   ${colors.yellow}/permissions [mode]${colors.reset}    查看或切换权限: read-only | workspace | full-access
   ${colors.yellow}/compact${colors.reset}               显式压缩当前会话上下文，释放 Token 消耗
   ${colors.yellow}/turn [n]${colors.reset}              查看执行记录的完整思考过程、工具调用与响应结果

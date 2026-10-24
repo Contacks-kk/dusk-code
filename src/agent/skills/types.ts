@@ -66,6 +66,7 @@ export interface SessionSkillState {
 export interface SkillSelection {
     skills: Array<{ name: string; reason: string }>;
     needsVisualVerification: boolean;
+    coverage?: Array<{ output: string; skills: string[]; reason?: string }>;
 }
 
 export interface SkillSnapshot {
@@ -100,6 +101,7 @@ export interface SkillExecutionRecord {
         status: "completed" | "failed" | "skipped";
         skills: SkillSelection["skills"];
         error?: string;
+        coverage?: SkillSelection["coverage"];
     };
     disabled: string[];
     snapshots: SkillSnapshot[];

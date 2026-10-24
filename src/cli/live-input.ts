@@ -11,6 +11,14 @@ export class LiveInputManager {
     private status = "";
     private isSuspended = false;
     private renderedLine = "";
+    private onSubmit?: (input: string) => Promise<void>;
+    private taskStatus = "";
+
+    /** 显示宿主任务状态，独立于模型思考提示 */
+    public setTaskStatus(status: string): void {
+        this.taskStatus = status;
+        this.renderInputLine();
+    }
 
     /** 更新执行状态并在空输入条中展示进度 */
     public setStatus(status: string): void {
@@ -47,14 +55,14 @@ export class LiveInputManager {
         const writeFn = this.originalWrite || process.stdout.write.bind(process.stdout);
         const content = this.buffer.length > 0
             ? `\x1b[38;5;255m${wrapTerminalText(this.buffer, Math.max(2, getTerminalWidth() - 2)).at(-1)}`
-            : this.status || "\x1b[38;5;242m(Agent 执行中，可继续输入)\x1b[0m";
+            : [this.taskStatus, this.status].filter(Boolean).join(" · ") || "\x1b[38;5;242m(Agent 执行中，可继续输入)\x1b[0m";
 
         this.renderedLine = truncateTerminalText(`\x1b[38;5;250m› ${content}`);
         writeFn(`\r\x1b[2K${this.renderedLine}\x1b[0m`);
     }
 
     /** 启动执行期输入框监听，允许用户在 Agent 运算期间键入内容 */
-    public start(): void {
+    public start(onSubmit?: (input: string) => Promise<void>): void {
         if (this.isRunning || !process.stdin.isTTY) {
             return;
         }
@@ -63,6 +71,7 @@ export class LiveInputManager {
         this.isSuspended = false;
         this.buffer = "";
         this.pendingInputs = [];
+        this.onSubmit = onSubmit;
         process.stdout.on("resize", this.onResize);
 
         // 劫持 stdout.write，在日志输出前抹除输入条，输出后恢复输入条
@@ -131,11 +140,18 @@ export class LiveInputManager {
         if (key.name === "return" || key.name === "enter") {
             const trimmed = this.buffer.trim();
             if (trimmed.length > 0) {
-                this.pendingInputs.push(trimmed);
+                if (this.onSubmit) {
+                    void this.onSubmit(trimmed).catch(error => {
+                        const write = this.originalErrorWrite || process.stderr.write.bind(process.stderr);
+                        write(`\n输入处理失败：${error instanceof Error ? error.message : String(error)}\n`);
+                    });
+                } else {
+                    this.pendingInputs.push(trimmed);
+                }
 
                 // 打印已接收提示并清空缓冲
                 const writeFn = this.originalWrite || process.stdout.write.bind(process.stdout);
-                writeFn(`\r\x1b[2K\x1b[38;5;250m› \x1b[38;5;255m${trimmed}\x1b[0m \x1b[90m(已捕获输入，等待当前执行阶段完成)\x1b[0m\n`);
+                writeFn(`\r\x1b[2K\x1b[38;5;250m› \x1b[38;5;255m${trimmed}\x1b[0m \x1b[90m(正在接收新要求)\x1b[0m\n`);
             }
             this.buffer = "";
             this.renderInputLine();
@@ -193,6 +209,8 @@ export class LiveInputManager {
         this.status = "";
         this.isSuspended = false;
         this.renderedLine = "";
+        this.taskStatus = "";
+        this.onSubmit = undefined;
 
         return captured;
     }
