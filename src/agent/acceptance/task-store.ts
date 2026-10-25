@@ -82,5 +82,5 @@ export function formatTaskStatus(status: TaskStatus | { summary: string }): stri
     if ("summary" in status) {
         return status.summary;
     }
-    return `当前目标：${status.goal}\n本轮要求：${status.request}\n阶段：${status.phase}\n已通过 ${status.counts.passed ?? 0} 项，待评审 ${status.counts.awaiting_review ?? 0} 项，失败 ${status.counts.failed ?? 0} 项。\n剩余预算：${Math.ceil(status.remainingMs / 1000)} 秒。${status.stoppedReason ? `\n停止原因：${status.stoppedReason}` : ""}`;
+    return `当前目标：${status.goal}\n本轮要求：${status.request}\n阶段：${status.phase}\n已通过 ${status.counts.passed ?? 0} 项，待评审 ${status.counts.awaiting_review ?? 0} 项，失败 ${status.counts.failed ?? 0} 项。\n耗时：${Math.ceil((status.elapsedMs ?? status.remainingMs ?? 0) / 1000)} 秒。${status.stoppedReason ? `\n停止原因：${status.stoppedReason}` : ""}`;
 }

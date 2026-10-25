@@ -97,20 +97,10 @@ export class AcceptanceRuntime {
             executionPolicy().verificationMs - (this.record.verificationElapsedMs ?? 0) - (Date.now() - this.budgetBegan));
     }
 
-    /** 首次候选完成后才开始计算二十分钟验收预算 */
+    /** 记录验收开始时间 */
     private startBudget(): void {
-        if (this.deadline) {
-            return;
-        }
         this.record.verificationStartedAt ??= Date.now();
-        this.budgetBegan = Date.now();
-        const remaining = Math.max(1, executionPolicy().verificationMs - (this.record.verificationElapsedMs ?? 0));
-        this.deadline = setTimeout(() => {
-            this.record.status = "unverified";
-            this.record.stoppedReason = `自动验收及续修达到时间上限（${executionPolicy().verificationMs / 1000}秒）`;
-            this.controller.abort();
-        }, remaining);
-        this.deadline.unref();
+        this.budgetBegan ??= Date.now();
     }
 
     /** 提供独立于历史摘要的完整要求和当前缺口 */

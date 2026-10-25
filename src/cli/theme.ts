@@ -3,9 +3,10 @@ import type { PermissionMode } from "../agent/runtime/permission-manager";
 import type { AgentExecutionStep, RunStatus } from "../agent/types";
 import { reasoningLabel } from "../agent/runtime/generation-policy";
 import { renderMarkdown } from "./markdown";
-import { imageArchiveReplacer } from "../utils/image";
-import { getTerminalWidth, wrapTerminalText } from "./terminal-layout";
+import { readToolDetails, isToolRecord } from "../agent/tools/result";
+import { getTerminalWidth, truncateTerminalText, wrapTerminalText } from "./terminal-layout";
 import { liveInputManager } from "./live-input";
+import { compactSummary, failureSummary, previewLine, resultFailed } from "./tool-summary";
 
 export const colors = {
     reset: "\x1b[0m",
@@ -48,7 +49,7 @@ export function formatPermissionBadge(mode: PermissionMode): string {
         case "read-only":
             return `${colors.blue}${colors.bold}[Read Only]${colors.reset}`;
         case "full-access":
-            return `${colors.brightRed}${colors.bold}[Full Access ⚠️]${colors.reset}`;
+            return `${colors.gray}[Full Access]${colors.reset}`;
         case "workspace":
         default:
             return `${colors.green}${colors.bold}[Workspace]${colors.reset}`;
@@ -56,27 +57,16 @@ export function formatPermissionBadge(mode: PermissionMode): string {
 }
 
 /** 提炼紧凑简短的工具返回结果，过滤冗余大报文 */
-export function formatCompactResult(result: any): string {
-    if (result === undefined || result === null) {
-        return "完成 (无返回值)";
-    }
-
-    if (typeof result === "object") {
-        if ("result" in result) {
-            return formatCompactResult(result.result);
-        }
-        const json = JSON.stringify(result, imageArchiveReplacer);
-        return json.length > 80 ? json.slice(0, 80) + "..." : json;
-    }
-
-    const str = String(result).replace(/[\r\n]+/g, " ").trim();
-    return str.length > 80 ? str.slice(0, 80) + "..." : str;
+export function formatCompactResult(result: unknown): string {
+    return truncateTerminalText(compactSummary(result), Math.min(80, getTerminalWidth()));
 }
 
 /** 格式化工具调用参数简要信息 */
 export function formatToolArgs(args: Record<string, any> = {}): string {
     const keys = Object.keys(args);
-    if (keys.length === 0) return "";
+    if (keys.length === 0) {
+        return "";
+    }
     const preview = keys
         .map((k) => {
             const v = args[k];
@@ -87,7 +77,7 @@ export function formatToolArgs(args: Record<string, any> = {}): string {
     return `(${preview.length > 80 ? preview.slice(0, 80) + "..." : preview})`;
 }
 
-/** 格式化 Claude Code 风格的工具调用标头 */
+/** 用简短动作和目标展示工具调用 */
 export function formatToolHeader(toolName: string, args: Record<string, any> = {}): string {
     let target = "";
     if (args.filePath) {
@@ -95,97 +85,70 @@ export function formatToolHeader(toolName: string, args: Record<string, any> = {
     } else if (args.directoryPath) {
         target = path.basename(path.resolve(args.directoryPath)) || ".";
     } else if (args.command) {
-        const cmdStr = args.command.replace(/[\r\n]+/g, " ").trim();
-        target = cmdStr.length > 40 ? cmdStr.slice(0, 40) + "..." : cmdStr;
+        target = args.command;
     } else if (args.query) {
         target = `"${args.query}"`;
     } else if (args.expression) {
         target = args.expression;
     }
 
-    switch (toolName) {
-        case "write_file":
-            return `${colors.bold}● Write(${target || "file"})${colors.reset}`;
-        case "read_file":
-        case "read_code":
-            return `${colors.bold}● Read(${target || "file"})${colors.reset}`;
-        case "apply_patch":
-            return `${colors.bold}● Patch(${target || "file"})${colors.reset}`;
-        case "execute_command":
-            return `${colors.bold}● Bash(${target || "command"})${colors.reset}`;
-        case "list_files":
-            return `${colors.bold}● List(${target || "."})${colors.reset}`;
-        case "grep_search":
-            return `${colors.bold}● Grep(${target || "pattern"})${colors.reset}`;
-        case "git_status":
-            return `${colors.bold}● Git(status)${colors.reset}`;
-        case "git_diff":
-            return `${colors.bold}● Git(diff)${colors.reset}`;
-        default:
-            return `${colors.bold}● ${toolName}(${target || formatToolArgs(args)})${colors.reset}`;
-    }
+    const actions: Record<string, string> = {
+        write_file: "写入",
+        read_file: "读取",
+        read_code: "读取",
+        apply_patch: "修改",
+        execute_command: "运行",
+        list_files: "列出",
+        grep_search: "搜索",
+        git_status: "查看 Git 状态",
+        git_diff: "查看 Git 差异"
+    };
+    const action = actions[toolName] || toolName;
+    const detail = target || (toolName.startsWith("git_") ? "" : formatToolArgs(args));
+    return truncateTerminalText(`${colors.gray}•${colors.reset} ${action}${detail ? ` ${previewLine(detail)}` : ""}`);
 }
 
-/** 格式化工具分支返回结果（Claude Code ⎿ 样式） */
+/** 显示一行工具结果，失败详情由执行记录按需展开 */
 export function formatToolBranchResult(
     toolName: string,
-    result: any,
+    result: unknown,
     durationMs?: number,
     isError?: boolean
 ): string {
-    const branchPrefix = `  ${colors.gray}⎿ ${colors.reset} `;
-    const durationSuffix = durationMs !== undefined ? ` ${colors.gray}(${formatDuration(durationMs)})${colors.reset}` : "";
-
-    if (isError) {
-        const errorText = typeof result === "string" ? result : (result?.message || JSON.stringify(result, imageArchiveReplacer));
-        return `${branchPrefix}${colors.red}Error: ${errorText}${colors.reset}${durationSuffix}`;
-    }
-
-    let summary = "";
-    if (toolName === "write_file") {
-        if (typeof result === "string" && result.includes("成功")) {
-            summary = result.trim();
-        } else {
-            summary = "Wrote file successfully";
-        }
+    const failed = resultFailed(result, isError);
+    const details = readToolDetails(result) ?? (isToolRecord(result) ? result : {});
+    let summary: string;
+    if (failed) {
+        summary = failureSummary(result);
+    } else if (toolName === "write_file") {
+        summary = typeof details.lineCount === "number" ? `已写入 ${details.lineCount} 行` : "已写入文件";
     } else if (toolName === "read_file" || toolName === "read_code") {
-        if (typeof result === "string") {
-            const lines = result.split(/\r?\n/).length;
-            summary = `Read ${lines} lines`;
-        } else {
-            summary = "Read file completed";
-        }
+        const lines = details.lineCount ?? (typeof result === "string" ? result.split(/\r?\n/).length : undefined);
+        summary = typeof lines === "number" ? `已读取 ${lines} 行` : "已读取文件";
     } else if (toolName === "apply_patch") {
-        summary = "Applied patch chunk(s) successfully";
+        summary = "已应用修改";
     } else if (toolName === "execute_command") {
-        if (typeof result === "object" && result !== null && "exitCode" in result) {
-            summary = `Exited with code ${result.exitCode}`;
-        } else {
-            summary = "Command execution completed";
-        }
+        summary = typeof details.exitCode === "number" ? `退出码 ${details.exitCode}` : "命令已完成";
     } else if (toolName === "grep_search") {
-        if (Array.isArray(result)) {
-            summary = `Found ${result.length} matches`;
-        } else {
-            summary = formatCompactResult(result);
-        }
+        const count = details.count ?? (Array.isArray(result) ? result.length : undefined);
+        summary = typeof count === "number" ? `${count} 处匹配` : compactSummary(result);
     } else if (toolName === "list_files") {
-        if (Array.isArray(result)) {
-            summary = `Listed ${result.length} entries`;
-        } else {
-            summary = formatCompactResult(result);
-        }
+        const count = details.totalCount ?? (Array.isArray(result) ? result.length : undefined);
+        summary = typeof count === "number" ? `${count} 项文件` : compactSummary(result);
     } else if (toolName === "git_status") {
-        if (typeof result === "object" && result !== null) {
-            summary = result.clean ? "Working tree clean" : "Status inspected";
-        } else {
-            summary = String(result).slice(0, 60);
-        }
+        summary = details.clean ? "工作区无改动" : "已查看状态";
     } else {
-        summary = formatCompactResult(result);
+        summary = compactSummary(result);
     }
 
-    return `${branchPrefix}${colors.white}${summary}${colors.reset}${durationSuffix}`;
+    const duration = durationMs !== undefined ? ` (${formatDuration(durationMs)})` : "";
+    const hint = failed ? " · /turn 详情" : "";
+    const suffix = `${duration}${hint}`;
+    const label = failed ? `${colors.yellow}未完成${colors.gray} · ` : "";
+    const prefix = `  ${colors.gray}└ ${label}`;
+    const width = getTerminalWidth();
+    const preview = truncateTerminalText(previewLine(summary), Math.max(1, width - stringWidth(prefix) - stringWidth(suffix)));
+    return `${truncateTerminalText(`${prefix}${preview}${colors.gray}${suffix}`, width)}${colors.reset}`;
 }
 
 import { rollingTicker } from "./rolling-ticker";
@@ -205,7 +168,7 @@ export function countScreenLines(text: string, cols = process.stdout.columns || 
     return total;
 }
 
-/** 渲染模型思考用时卡片 */
+/** 渲染模型思考用时摘要 */
 export function renderThought(durationMs: number, turnNo = 1): void {
     turnHistoryManager.recordThoughtLine(turnNo);
     turnHistoryManager.recordOutputLines(1);
@@ -217,7 +180,7 @@ export function renderCrunchedSummary(totalMs: number, deliveryStatus?: string):
     rollingTicker.flush();
     turnHistoryManager.recordOutputLines(3);
     const label = deliveryStatus === "passed" ? "验收通过" : deliveryStatus && deliveryStatus !== "not_required" ? "本轮执行结束，验收未完成" : "本轮执行结束";
-    console.log(`\n${colors.cyan}✻ ${label} (本轮耗时: ${formatDuration(totalMs)})${colors.reset}\n`);
+    console.log(`\n${colors.gray}─ ${label} · ${formatDuration(totalMs)}${colors.reset}\n`);
 }
 
 /** 渲染思考、工具和中间回复，隐藏内部循环编号 */
@@ -226,8 +189,15 @@ export function renderLiveStep(step: AgentExecutionStep): void {
 
     if (step.type === "task_status" && step.taskStatus) {
         const state = step.taskStatus;
-        const phases = { routing: "识别要求", pending: "实现", verifying: "验收", repairing: "续修", not_required: "处理要求", finished: "结束" };
-        liveInputManager.setTaskStatus(`本轮 ${state.request.slice(0, 24)} · ${phases[state.phase] ?? state.phase} · 通过 ${state.counts.passed ?? 0} · 待评审 ${state.counts.awaiting_review ?? 0} · 剩余 ${formatDuration(state.remainingMs)}`);
+        const phases = {
+            routing: "识别要求",
+            pending: "实现",
+            verifying: "验收",
+            repairing: "续修",
+            not_required: "处理要求",
+            finished: "结束"
+        };
+        liveInputManager.setTaskStatus(`本轮 ${state.request.slice(0, 24)} · ${phases[state.phase] ?? state.phase} · 通过 ${state.counts.passed ?? 0} · 待评审 ${state.counts.awaiting_review ?? 0} · 耗时 ${formatDuration(state.elapsedMs ?? state.remainingMs ?? 0)}`);
     } else if (step.type === "turn_start") {
         rollingTicker.setStage("正在等待模型响应");
         turnHistoryManager.recordTurnStart(turnNo);
@@ -246,7 +216,7 @@ export function renderLiveStep(step: AgentExecutionStep): void {
         turnHistoryManager.recordIntermediateText(turnNo, step.content ?? "");
         const md = renderMarkdown(step.content ?? "");
         turnHistoryManager.recordOutputLines(countScreenLines(md) + 3);
-        console.log(`\n${colors.magenta}● Assistant${colors.reset}\n`);
+        console.log(`\n${colors.gray}•${colors.reset}\n`);
         console.log(md);
     } else if (step.type === "tool_call") {
         rollingTicker.setStage(`正在执行 ${step.toolName || "工具"}`);
@@ -259,34 +229,38 @@ export function renderLiveStep(step: AgentExecutionStep): void {
         console.log(`\n${formatToolHeader(step.toolName || "tool", step.args)}`);
     } else if (step.type === "tool_result") {
         rollingTicker.setStage("正在等待模型继续回复");
+        const failed = resultFailed(step.result, step.isError);
         turnHistoryManager.recordToolResult(
             turnNo,
             step.toolCallId || "",
             step.result,
             step.durationMs,
-            step.isError
+            failed
         );
-        const branchLine = formatToolBranchResult(step.toolName || "tool", step.result, step.durationMs, step.isError);
-        const hint = ` ${colors.dim}[输入 /turn 查看完整响应]${colors.reset}`;
+        const branchLine = formatToolBranchResult(step.toolName || "tool", step.result, step.durationMs, failed);
         turnHistoryManager.recordOutputLines(1);
-        console.log(`${branchLine}${hint}`);
+        console.log(branchLine);
     } else if (step.type === "turn_end") {
         turnHistoryManager.finishTurn(turnNo);
         rollingTicker.setStage("正在整理回复");
     } else if (step.type === "status") {
-        rollingTicker.setStage(step.content ?? "生成状态更新");
+        const content = previewLine(step.content ?? "生成状态更新");
+        if (/^模型生成中，已等待/.test(content)) {
+            return;
+        }
+        rollingTicker.setStage(content);
         turnHistoryManager.recordOutputLines(2);
-        console.log(`\n${colors.cyan}↻ ${step.content ?? "生成状态更新"}${colors.reset}`);
+        console.log(`\n${colors.gray}• ${truncateTerminalText(content, Math.max(1, getTerminalWidth() - 2))}${colors.reset}`);
     }
 }
 
-/** 渲染包含原生 Markdown 终端美化的高级 Assistant 回复 */
+/** 用普通正文展示最终回复与执行状态 */
 export function renderAssistantReply(content: string, status?: RunStatus): void {
     rollingTicker.flush();
     const label = status && status !== "completed" ? ` [${status}]` : "";
     const md = renderMarkdown(content || "本轮没有可显示的回复，请查看执行状态。");
     turnHistoryManager.recordOutputLines(countScreenLines(md) + 3);
-    console.log(`\n${colors.magenta}● Assistant${label}${colors.reset}\n`);
+    console.log(`\n${colors.gray}•${label}${colors.reset}\n`);
     console.log(md);
 }
 
@@ -335,17 +309,9 @@ export function printImageAttachmentBadge(imagePaths: string[]): void {
     console.log(`  ${colors.cyan}📷 附加图片 [${imagePaths.length}]: ${colors.bold}${names}${colors.reset}\n`);
 }
 
-/** 打印 Full Access 危险权限安全警告卡片 */
+/** 简短说明全量授权模式的权限范围 */
 export function printFullAccessWarning(): void {
-    console.log(`
-${colors.brightYellow}┌──────────────────────────────── 安全风险警报 ────────────────────────────────┐
-│ ⚠️  您已切换至 [Full Access] 全量授权模式！                                  │
-│                                                                              │
-│ 1. Agent 具有任意终端命令执行与跨目录写文件权限。                           │
-│ 2. 系统将不再拦截越界写入或敏感凭证修改操作。                               │
-│ 3. 建议仅在隔离的测试沙箱或明确受信任的仓库中开启。                         │
-└──────────────────────────────────────────────────────────────────────────────┘${colors.reset}
-`);
+    console.log(`\n${colors.gray}Full Access：允许执行命令及跨目录写入，不再逐项确认。${colors.reset}\n`);
 }
 
 /** 打印斜杠命令帮助表 */

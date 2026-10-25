@@ -141,8 +141,10 @@ export interface TaskStatus {
     phase: string;
     instructionRevision: number;
     counts: Partial<Record<import("./acceptance/types").CheckStatus, number>>;
-    remainingMs: number;
+    remainingMs?: number;
+    elapsedMs: number;
     stoppedReason?: string;
+    statusBar?: import("./status/types").TaskStatusBarSnapshot;
 }
 
 import type { ResponseQuality, SalvagedContent } from "./runtime/response-salvager";

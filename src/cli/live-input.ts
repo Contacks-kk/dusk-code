@@ -10,7 +10,7 @@ export class LiveInputManager {
     private originalErrorWrite?: typeof process.stderr.write;
     private status = "";
     private isSuspended = false;
-    private renderedLine = "";
+    private renderedLines: string[] = [];
     private onSubmit?: (input: string) => Promise<void>;
     private taskStatus = "";
 
@@ -20,7 +20,7 @@ export class LiveInputManager {
         this.renderInputLine();
     }
 
-    /** 更新执行状态并在空输入条中展示进度 */
+    /** 更新底部执行状态并保留正在输入的内容 */
     public setStatus(status: string): void {
         this.status = status;
         this.renderInputLine();
@@ -34,10 +34,9 @@ export class LiveInputManager {
     /** 弹出确认菜单前暂停输入条和键盘处理 */
     public pause(): void {
         if (this.isActive()) {
-            this.originalWrite?.("\r\x1b[2K");
+            this.clearInputLines();
         }
         this.isSuspended = true;
-        this.renderedLine = "";
     }
 
     /** 确认菜单关闭后恢复暂存的输入 */
@@ -46,19 +45,33 @@ export class LiveInputManager {
         this.renderInputLine();
     }
 
-    /** 渲染当前执行态输入条 */
+    /** 清除底部临时区域，终端缩放后按实际折行数回到起点 */
+    private clearInputLines(): void {
+        if (!this.renderedLines.length) {
+            return;
+        }
+        const rows = this.renderedLines.reduce((total, line) => total + wrapTerminalText(line, getTerminalWidth() + 1).length, 0);
+        const write = this.originalWrite || process.stdout.write.bind(process.stdout);
+        write(`\r${rows > 1 ? `\x1b[${rows - 1}A` : ""}\x1b[0J`);
+        this.renderedLines = [];
+    }
+
+    /** 分行显示等待状态与输入内容，输入时仍能看见当前进度 */
     private renderInputLine(): void {
         if (!this.isActive() || !process.stdout.isTTY) {
             return;
         }
 
         const writeFn = this.originalWrite || process.stdout.write.bind(process.stdout);
+        const status = [this.status, this.taskStatus].filter(Boolean).join(" · ") || "\x1b[90m正在处理请求\x1b[0m";
         const content = this.buffer.length > 0
-            ? `\x1b[38;5;255m${wrapTerminalText(this.buffer, Math.max(2, getTerminalWidth() - 2)).at(-1)}`
-            : [this.taskStatus, this.status].filter(Boolean).join(" · ") || "\x1b[38;5;242m(Agent 执行中，可继续输入)\x1b[0m";
-
-        this.renderedLine = truncateTerminalText(`\x1b[38;5;250m› ${content}`);
-        writeFn(`\r\x1b[2K${this.renderedLine}\x1b[0m`);
+            ? `\x1b[37m${wrapTerminalText(this.buffer, Math.max(1, getTerminalWidth() - 2)).at(-1)}`
+            : "\x1b[90m输入新要求，Enter 发送\x1b[0m";
+        this.clearInputLines();
+        const input = truncateTerminalText(`\x1b[37m› ${content}`);
+        this.renderedLines = process.stdout.rows && process.stdout.rows < 3 ? [this.buffer ? input : truncateTerminalText(status)] :
+            [truncateTerminalText(`  ${status}`), input];
+        writeFn(this.renderedLines.map(line => `\r\x1b[2K${line}\x1b[0m`).join("\n"));
     }
 
     /** 启动执行期输入框监听，允许用户在 Agent 运算期间键入内容 */
@@ -74,7 +87,7 @@ export class LiveInputManager {
         this.onSubmit = onSubmit;
         process.stdout.on("resize", this.onResize);
 
-        // 劫持 stdout.write，在日志输出前抹除输入条，输出后恢复输入条
+        // 日志输出前让出底部区域，输出后恢复状态与输入
         this.originalWrite = process.stdout.write.bind(process.stdout);
         this.originalErrorWrite = process.stderr.write.bind(process.stderr);
         process.stdout.write = this.wrapOutput(this.originalWrite);
@@ -91,7 +104,7 @@ export class LiveInputManager {
     private wrapOutput(write: typeof process.stdout.write): typeof process.stdout.write {
         return ((chunk: any, encoding?: any, callback?: any) => {
             if (this.isActive()) {
-                this.originalWrite?.("\r\x1b[2K");
+                this.clearInputLines();
             }
             const result = write(chunk, encoding, callback);
             if (this.isActive()) {
@@ -111,11 +124,6 @@ export class LiveInputManager {
             return;
         }
 
-        // 窗口缩小时先移除旧输入条折出的行，避免残留在新状态上方
-        const rows = wrapTerminalText(this.renderedLine, getTerminalWidth() + 1).length;
-        if (rows > 1) {
-            this.originalWrite?.(`\r\x1b[${rows - 1}A\x1b[0J`);
-        }
         this.renderInputLine();
     };
 
@@ -136,22 +144,20 @@ export class LiveInputManager {
             return;
         }
 
-        // 回车暂存当前输入
+        // 回车提交当前输入
         if (key.name === "return" || key.name === "enter") {
             const trimmed = this.buffer.trim();
             if (trimmed.length > 0) {
                 if (this.onSubmit) {
                     void this.onSubmit(trimmed).catch(error => {
-                        const write = this.originalErrorWrite || process.stderr.write.bind(process.stderr);
-                        write(`\n输入处理失败：${error instanceof Error ? error.message : String(error)}\n`);
+                        process.stderr.write(`输入未接收：${error instanceof Error ? error.message : String(error)}\n`);
                     });
                 } else {
                     this.pendingInputs.push(trimmed);
                 }
 
-                // 打印已接收提示并清空缓冲
-                const writeFn = this.originalWrite || process.stdout.write.bind(process.stdout);
-                writeFn(`\r\x1b[2K\x1b[38;5;250m› \x1b[38;5;255m${trimmed}\x1b[0m \x1b[90m(正在接收新要求)\x1b[0m\n`);
+                // 回显用户提交的要求
+                process.stdout.write(`\x1b[37m› ${trimmed}\x1b[0m\n`);
             }
             this.buffer = "";
             this.renderInputLine();
@@ -185,13 +191,13 @@ export class LiveInputManager {
             return [];
         }
 
+        this.clearInputLines();
         this.isRunning = false;
         process.stdout.off("resize", this.onResize);
         const input = mouseTracker.isActive() ? mouseTracker.input : process.stdin;
         input.off("keypress", this.onKeypress);
 
         if (this.originalWrite) {
-            this.originalWrite("\r\x1b[2K");
             process.stdout.write = this.originalWrite;
             this.originalWrite = undefined;
         }
@@ -208,7 +214,7 @@ export class LiveInputManager {
         this.pendingInputs = [];
         this.status = "";
         this.isSuspended = false;
-        this.renderedLine = "";
+        this.renderedLines = [];
         this.taskStatus = "";
         this.onSubmit = undefined;
 

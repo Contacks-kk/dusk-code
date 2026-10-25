@@ -34,6 +34,8 @@ import type { ModelConfig } from "../agent/runtime/model-config";
 import { classifyTurn, explicitControl, turnControl, executionPolicy, type TurnControl } from "../agent/runtime/turn-control";
 import { ActiveRun, type PendingInput } from "../agent/runtime/active-run";
 import { TaskStore, taskFacts } from "../agent/acceptance/task-store";
+import { TaskStatusBarTracker } from "../agent/status/tracker";
+import type { TaskStatus } from "../agent/types";
 
 interface ChatOptions {
     projectId?: number;
@@ -139,15 +141,15 @@ export class AgentService {
         if (opts.onStep) {
             this.progressListeners.set(runtime.runId, opts.onStep);
         }
-        const timeout = AbortSignal.timeout(executionPolicy().runMs);
-        const parent = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+        const parent = opts.signal;
         runtime.parentSignal = parent;
         let prepared: PendingInput | undefined;
         let result: AgentRunResult;
         try {
             while (true) {
-                const signal = AbortSignal.any([parent, runtime.controller.signal]);
+                const signal = parent ? AbortSignal.any([parent, runtime.controller.signal]) : runtime.controller.signal;
                 try {
+                    //! 驱动单轮会话的 Agent Loop 运算
                     result = await this.chatTurn(selected.id, prepared?.message ?? userInput, { ...opts, runtime, prepared, signal,
                         verification: prepared ? undefined : opts.verification, imagePaths: prepared ? undefined : opts.imagePaths });
                 } catch (error) {
@@ -163,6 +165,7 @@ export class AgentService {
                 const waiting = runtime.pending.splice(0).sort((left, right) => left.control.instructionRevision - right.control.instructionRevision);
                 prepared = waiting.pop();
                 for (const superseded of waiting) {
+                    // 为无需工具的回答保存完整结束状态
                     db.update(turn).set({ executionJson: { ...this.shortExecution(superseded.control, modelConfigManager.getModelConfig()),
                         status: "aborted", error: "后续用户要求已取代本轮执行，消息仍保留在历史中" } }).where(eq(turn.id, superseded.turnId)).run();
                 }
@@ -207,23 +210,22 @@ export class AgentService {
         if (!images.length && (/(?:启动|进度|状态)/.test(input) || /^(?:请)?(?:直接|只)(?:回答|告诉我)(?:[，,].*)?[。！!\s]*$/.test(input))) {
             return taskFacts(task);
         }
-        const timeout = AbortSignal.timeout(executionPolicy().answerMs);
         const request = prepareModelRequest({ systemPrompt: "根据已有事实直接回答本轮问题。没有工具，不能宣称重新检查、启动或验证。事实的时间代表最后观察时间，不代表当前状态。",
             messages: [{ role: "user", content: [{ type: "text", text: JSON.stringify({ input, facts: taskFacts(task), recent }) }, ...images], timestamp: Date.now() }] },
-            model.capabilities, "answer", "off", 4096, { apiKey: model.apiKey, maxRetries: 0, timeoutMs: executionPolicy().answerMs,
-                signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+            model.capabilities, "answer", "off", 4096, { apiKey: model.apiKey, maxRetries: 0,
+                signal });
         const started = Date.now();
         try {
             const response = await streamSimple(request.model, request.context, request.options).result();
             finishRequestDiagnostics(request.diagnostics, response, started);
             signal?.throwIfAborted();
-            if (response.stopReason !== "stop" || timeout.aborted) {
+            if (response.stopReason !== "stop") {
                 throw new Error("回答未完成");
             }
             return response.content.filter(block => block.type === "text").map(block => block.text).join("") || taskFacts(task);
         } catch {
             signal?.throwIfAborted();
-            request.diagnostics.failure = timeout.aborted ? "timeout" : "answer_failed";
+            request.diagnostics.failure = "answer_failed";
             return taskFacts(task);
         } finally {
             request.diagnostics.durationMs = Date.now() - started;
@@ -514,9 +516,19 @@ export class AgentService {
                 opts.runtime.control = control;
             }
 
+            // 初始化任务状态栏追踪器
+            const statusBarTracker = new TaskStatusBarTracker(
+                projectRoot,
+                (previous?.contract.originalInput ?? userInput).slice(0, 300),
+                "replace",
+                executionPolicy().runMs
+            );
+
             /** 从宿主状态生成终端及SSE共用的进度 */
-            const publish = (record?: DeliveryRecord, phase = "running") => {
-                const status = {
+            const publish = (record?: DeliveryRecord, phase = "running"): TaskStatus => {
+                const startedAt = opts.runtime?.startedAt ?? Date.now();
+                const elapsedMs = Math.max(0, Date.now() - startedAt);
+                const status: TaskStatus = {
                     request: userInput.slice(0, 300),
                     runId: opts.runtime?.runId ?? "",
                     sessionId: targetSession.id,
@@ -527,9 +539,10 @@ export class AgentService {
                     phase,
                     counts: Object.fromEntries(["pending", "running", "awaiting_review", "passed", "failed", "blocked", "stale"]
                         .map(state => [state, record?.contract.checks.filter(check => check.status === state).length ?? 0])),
-                    remainingMs: Math.max(0, Math.min(acceptance?.remainingBudgetMs ?? Infinity,
-                        executionPolicy().runMs - (Date.now() - (opts.runtime?.startedAt ?? Date.now())))),
-                    stoppedReason: record?.stoppedReason
+                    elapsedMs,
+                    remainingMs: elapsedMs,
+                    stoppedReason: record?.stoppedReason,
+                    statusBar: statusBarTracker.snapshot(nextTurnNo, 1, record)
                 };
                 if (opts.runtime) {
                     opts.runtime.status = status;
@@ -551,9 +564,18 @@ export class AgentService {
                     tx.update(turn).set({ executionJson: execution }).where(eq(turn.id, createdTurn.id)).run();
                     tx.insert(message).values({ turnId: createdTurn.id, role: "assistant", content: reply }).run();
                 });
-                return { sessionId: targetSession.id, turnId: createdTurn.id, turnNo: nextTurnNo, reply, steps: [], status: "completed", execution };
+                return { 
+                    sessionId: targetSession.id, 
+                    turnId: createdTurn.id, 
+                    turnNo: nextTurnNo, 
+                    reply, 
+                    steps: [], 
+                    status: "completed", 
+                    execution 
+                };
             }
 
+            // 将数据库中的历史消息转换为 Pi Agent 可理解的上下文
             const initialMessages = await this.convertDbMessagesToAgent(rawHistory);
             const taskHistory = previous ? [...rawHistory, { turn: { executionJson: { delivery: previous } as ExecutionRecord }, messages: [] }] : rawHistory;
 
@@ -687,6 +709,9 @@ export class AgentService {
                 onStep: opts.onStep,
                 onAskPermission: opts.onAskPermission,
                 signal: acceptance.signal,
+                statusBarTracker,
+                statusBarMode: "replace",
+                sessionId: targetSession.id,
                 /** 在下一次请求或工具执行前保存本次调用快照 */
                 onExecution: saveCheckpoint
             });

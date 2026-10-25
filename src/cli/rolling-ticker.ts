@@ -1,4 +1,3 @@
-import { stripVTControlCharacters } from "node:util";
 import { colors, formatDuration } from "./theme";
 import { mouseTracker } from "./mouse-tracker";
 import { liveInputManager } from "./live-input";
@@ -12,7 +11,6 @@ export class RollingTicker {
     private isActive = false;
     private spinnerIndex = 0;
     private stage = "正在准备请求";
-    private lastProgressTime = 0;
     private timer?: NodeJS.Timeout;
 
     /** 提交任务后立即显示状态并定时刷新等待进度 */
@@ -20,7 +18,6 @@ export class RollingTicker {
         this.flush();
         this.buffer = "";
         this.startTime = Date.now();
-        this.lastProgressTime = this.startTime;
         this.isActive = true;
         this.spinnerIndex = 0;
         this.stage = "正在准备请求";
@@ -54,7 +51,7 @@ export class RollingTicker {
         this.timer.unref();
     }
 
-    /** 保存最新思考并在下一次刷新时展示末尾内容 */
+    /** 缓存完整思考并切换底部状态 */
     public update(delta: string): void {
         if (!this.isActive) {
             this.start();
@@ -63,7 +60,7 @@ export class RollingTicker {
         this.buffer += delta;
     }
 
-    /** 刷新活动提示，并定期追加可回看的进度行 */
+    /** 原地刷新等待状态，不向历史记录追加定时进度 */
     private render(): void {
         if (!this.isActive) {
             return;
@@ -72,23 +69,13 @@ export class RollingTicker {
         const now = Date.now();
         const elapsed = formatDuration(now - this.startTime);
         const spinner = SPINNER_FRAMES[this.spinnerIndex++ % SPINNER_FRAMES.length];
-        const snippet = this.stage === "正在思考"
-            ? stripVTControlCharacters(this.buffer.slice(-160)).replace(/[\r\n\t]+/g, " ").trim()
-            : "";
-        const detail = snippet ? ` · ${snippet}` : "";
-        const status = `${this.stage} · 已用时 ${elapsed}${detail}`;
-
-        // 低频追加真实阶段与思考进展，让长时间等待也有可见记录
-        if (now - this.lastProgressTime >= 5000) {
-            this.lastProgressTime = now;
-            console.log(`${colors.gray}${truncateTerminalText(`  ↻ ${status}`)}${colors.reset}`);
-        }
+        const status = `${this.stage} (${elapsed})`;
 
         if (!process.stdout.isTTY) {
             return;
         }
 
-        const line = `${colors.cyan}${spinner}${colors.reset} ${colors.gray}${status}${colors.reset}`;
+        const line = `${colors.gray}${spinner} ${status}${colors.reset}`;
         if (liveInputManager.isActive()) {
             liveInputManager.setStatus(line);
         } else {
@@ -102,7 +89,9 @@ export class RollingTicker {
             return;
         }
         const timeText = formatDuration(durationMs ?? (Date.now() - this.startTime));
-        mouseTracker.writeThought(`Thought for ${timeText} (${this.buffer.length.toLocaleString()} chars)`, this.buffer);
+        if (this.buffer.trim()) {
+            mouseTracker.writeThought(`已思考 ${timeText}`, this.buffer);
+        }
         this.buffer = "";
         this.setStage("正在生成回复");
     }

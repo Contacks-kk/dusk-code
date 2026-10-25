@@ -107,7 +107,6 @@ export async function classifyTurn(input: string, config: ModelConfig, task: Del
         return explicit;
     }
     const started = Date.now();
-    const timeout = AbortSignal.timeout(executionPolicy().intentMs);
     const request = prepareModelRequest({
         systemPrompt: `仅分类最新用户消息，历史目标不是当前执行授权。只输出JSON：{"intent":"answer|inspect|plan|execute|verify|stop","scope":"none|startup|contract","resumeTask":false,"resumeAfterAnswer":false,"allowVerification":false}。
 状态询问、能否启动、直接回答归answer，不运行工具。检查能否启动归inspect/startup；帮我启动归execute/startup。分析源码归inspect，设计方案归plan。开发修复归execute/contract，默认允许适用验收；修复后直接告诉我结果仍是execute。继续验收归verify。补充当前开发要求resumeTask=true，新目标false。普通进度询问resumeAfterAnswer=true，明确只回答或停止则false。明确不测试则allowVerification=false。`,
@@ -117,14 +116,12 @@ export async function classifyTurn(input: string, config: ModelConfig, task: Del
     }, config.capabilities, "turn_intent", "off", 1024, {
         apiKey: config.apiKey,
         maxRetries: 0,
-        timeoutMs: executionPolicy().intentMs,
-        signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+        signal
     });
     try {
         const response = await streamSimple(request.model, request.context, request.options).result();
         finishRequestDiagnostics(request.diagnostics, response, started);
         signal?.throwIfAborted();
-        timeout.throwIfAborted();
         if (response.stopReason !== "stop") {
             throw new Error("意图分类没有完成");
         }

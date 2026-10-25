@@ -20,6 +20,9 @@ import {
     buildRecoveryPrompt,
     aggregateTextChunks
 } from "./runtime/truncation-recovery";
+import { TaskStatusBarTracker } from "./status/tracker";
+import type { StatusBarMode } from "./status/types";
+import { SpillPolicy } from "./spill/spill-policy";
 
 export interface RunnerOptions extends Partial<GenerationPolicy> {
     control?: TurnControl;
@@ -45,6 +48,10 @@ export interface RunnerOptions extends Partial<GenerationPolicy> {
     onStep?: (step: AgentExecutionStep) => void;
     onAskPermission?: (prompt: string) => Promise<boolean>;
     onExecution?: (snapshot: ExecutionRecord, settledSteps?: AgentExecutionStep[]) => void;
+    statusBarTracker?: TaskStatusBarTracker;
+    statusBarMode?: StatusBarMode;
+    sessionId?: number;
+    spillPolicy?: SpillPolicy;
     signal?: AbortSignal;
 }
 
@@ -89,6 +96,8 @@ export class AgentRunner {
     private originalUser?: AgentMessage;
     private contextCoordinator?: ContextCoordinator;
     private imageInputUnavailable = false;
+    private readonly statusBar?: TaskStatusBarTracker;
+    private readonly spillPolicy: SpillPolicy;
 
     /** 让文件和命令工具使用目标项目目录，权限检查与实际操作采用相同路径 */
     private projectArguments(name: string, args: unknown): unknown {
@@ -129,6 +138,53 @@ export class AgentRunner {
             windowExplicit: options.contextWindow !== undefined
         });
         this.contextWindow = this.capabilities.contextWindow;
+        this.statusBar = options.statusBarTracker ?? (options.projectRoot ? new TaskStatusBarTracker(
+            options.projectRoot,
+            options.control?.intent ?? "执行任务",
+            options.statusBarMode ?? "replace",
+            this.policy.generationTimeoutMs ?? 180000
+        ) : undefined);
+        this.spillPolicy = options.spillPolicy ?? new SpillPolicy();
+    }
+
+    /** 将当前最新的任务状态栏动态注入到发送给模型的最后一帧上下文 */
+    private injectStatusBar(messages: AgentMessage[], callNo: number): AgentMessage[] {
+        if (!this.statusBar || messages.length === 0) {
+            return messages;
+        }
+        const cloned = [...messages];
+        const lastIndex = cloned.length - 1;
+        const lastMsg = cloned[lastIndex];
+        const statusText = this.statusBar.render(
+            this.options.currentTurnNo ?? 1,
+            callNo,
+            this.options.acceptance?.record
+        );
+
+        // 为字符串类型内容追加状态栏
+        if (typeof lastMsg.content === "string") {
+            cloned[lastIndex] = {
+                ...lastMsg,
+                content: `${lastMsg.content}\n\n${statusText}`
+            };
+            return cloned;
+        }
+
+        // 为多块类型内容追加文本块
+        if (Array.isArray(lastMsg.content)) {
+            cloned[lastIndex] = {
+                ...lastMsg,
+                content: [
+                    ...lastMsg.content,
+                    {
+                        type: "text" as const,
+                        text: `\n\n${statusText}`
+                    }
+                ]
+            };
+            return cloned;
+        }
+        return cloned;
     }
 
     /**
@@ -251,7 +307,37 @@ export class AgentRunner {
                 execution.pendingToolCallIds.push(args[0]);
                 /** 执行工具前先保存待结算状态，写库失败时禁止产生副作用 */
                 onCallCompleted();
-                return tool.execute(...args);
+                try {
+                    const rawResult = await tool.execute(...args);
+
+                    // 检查并处理超长工具输出下溢存盘
+                    const result = await this.spillPolicy.processResult(
+                        tool.name,
+                        args[0],
+                        rawResult,
+                        {
+                            sessionId: this.options.sessionId ?? 0,
+                            projectRoot: this.options.projectRoot ?? process.cwd()
+                        }
+                    );
+
+                    // 记录工具调用成功状态
+                    this.statusBar?.recordToolCall(
+                        tool.name,
+                        args[1] as Record<string, unknown>,
+                        false
+                    );
+                    return result;
+                } catch (error) {
+                    // 记录工具调用失败状态
+                    this.statusBar?.recordToolCall(
+                        tool.name,
+                        args[1] as Record<string, unknown>,
+                        true,
+                        String(error)
+                    );
+                    throw error;
+                }
             }
         }));
         const model = sdkModel(this.capabilities);
@@ -372,7 +458,8 @@ export class AgentRunner {
                     if (this.policy.generationTimeoutMs) timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.policy.generationTimeoutMs);
                     let overflowRetried = false;
                     for (let requestAttempt = 0; requestAttempt < 3; requestAttempt++) {
-                        const request = prepareModelRequest({ ...context, systemPrompt: prepared.systemPrompt, messages: withoutRuntimeControl(prepared.messages) }, this.capabilities,
+                        const requestMessages = this.injectStatusBar(withoutRuntimeControl(prepared.messages), call.callNo);
+                        const request = prepareModelRequest({ ...context, systemPrompt: prepared.systemPrompt, messages: requestMessages }, this.capabilities,
                             summary.attemptNo === 1 ? "task" : "recovery", effort, summary.maxTokens, {
                                 ...options,
                                 apiKey: this.options.apiKey,
