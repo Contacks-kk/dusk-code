@@ -4,6 +4,7 @@ import type {
     StatusBarMode,
     SystemEnvironmentInfo,
     TaskStatusBarSnapshot,
+    TodoItem,
     ToolExecutionStat
 } from "./types";
 
@@ -12,6 +13,7 @@ export class TaskStatusBarTracker {
     private readonly toolCalls: Record<string, ToolExecutionStat> = {};
     private readonly modifiedFiles = new Set<string>();
     private readonly systemInfo: SystemEnvironmentInfo;
+    private todos: TodoItem[] = [];
     private lastError?: {
         toolName: string;
         message: string;
@@ -24,7 +26,8 @@ export class TaskStatusBarTracker {
         private readonly workspaceRoot: string,
         private readonly goal: string,
         private readonly mode: StatusBarMode = "replace",
-        private readonly totalBudgetMs: number = 180000
+        private readonly totalBudgetMs: number = 180000,
+        private readonly intent: string = "执行任务"
     ) {
         this.systemInfo = {
             platform: `${os.platform()} (${os.release()})`,
@@ -66,6 +69,16 @@ export class TaskStatusBarTracker {
         }
     }
 
+    /** 全量替换当前待办任务清单快照 */
+    updateTodos(todos: TodoItem[]): void {
+        this.todos = structuredClone(todos);
+    }
+
+    /** 获取当前待办任务清单快照 */
+    getTodos(): TodoItem[] {
+        return structuredClone(this.todos);
+    }
+
     /** 生成当前最新快照数据 */
     snapshot(currentTurnNo: number, callNo: number, delivery?: DeliveryRecord): TaskStatusBarSnapshot {
         const elapsedSeconds = Math.floor((Date.now() - this.startedAt) / 1000);
@@ -99,8 +112,9 @@ export class TaskStatusBarTracker {
             },
             plan: {
                 goal: this.goal,
-                intent: delivery?.contract.intent ?? "执行任务",
-                items
+                intent: this.intent,
+                items,
+                todos: this.todos.length > 0 ? structuredClone(this.todos) : undefined
             },
             lastError: this.lastError ? structuredClone(this.lastError) : undefined
         };
@@ -115,11 +129,19 @@ export class TaskStatusBarTracker {
             return `${name}: ${s.count}${s.failures ? `[失败:${s.failures}]` : ""}`;
         }).join(", ") || "暂无";
 
-        // 格式化 TODO 项
-        const todoLines = snap.plan.items.map(item => {
-            const marker = item.status === "passed" ? "[x]" : item.status === "running" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
-            return `  ${marker} ${item.title} (${item.status})`;
-        });
+        // 格式化 TODO 项：优先使用模型自主规划的 todos，其次降级到契约系统的 items
+        let todoLines: string[] = [];
+        if (this.todos.length > 0) {
+            todoLines = this.todos.map(item => {
+                const marker = item.status === "completed" ? "[x]" : item.status === "in_progress" ? "[>]" : "[ ]";
+                return `  ${marker} ${item.content} (${item.status})`;
+            });
+        } else if (snap.plan.items.length > 0) {
+            todoLines = snap.plan.items.map(item => {
+                const marker = item.status === "passed" ? "[x]" : item.status === "running" ? "[>]" : item.status === "failed" ? "[!]" : "[ ]";
+                return `  ${marker} ${item.title} (${item.status})`;
+            });
+        }
 
         const lines: string[] = [
             "【任务状态栏 / Task Status Bar】",

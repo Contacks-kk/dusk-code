@@ -36,6 +36,13 @@ export interface LastExecutionError {
     consecutiveFailures: number;
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed";
+
+export interface TodoItem {
+    content: string;
+    status: TodoStatus;
+}
+
 export interface TaskStatusBarSnapshot {
     mode: StatusBarMode;
     system: SystemEnvironmentInfo;
@@ -49,6 +56,7 @@ export interface TaskStatusBarSnapshot {
         goal: string;
         intent: string;
         items: TaskTodoItem[];
+        todos?: TodoItem[];
     };
     lastError?: LastExecutionError;
 }

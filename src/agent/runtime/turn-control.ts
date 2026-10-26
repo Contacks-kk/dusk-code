@@ -93,8 +93,11 @@ export function explicitControl(input: string, revision = 1): TurnControl | unde
         const intent = /验收/.test(text) ? "verify" : "execute";
         return { ...turnControl(input, intent, revision), resumeTask: true };
     }
-    if (text.startsWith("【PLANNING")) {
+    if (text.startsWith("【PLANNING") || /^(?:\/plan|进入计划模式|开启计划模式)(?:\s+.*)?$/i.test(text)) {
         return turnControl(input, "plan", revision);
+    }
+    if (/^(?:\/plan\s+off|\/plan\s+exit|退出计划模式|关闭计划模式)[。！!\s]*$/i.test(text)) {
+        return turnControl(input, "execute", revision);
     }
     return undefined;
 }
@@ -143,7 +146,7 @@ export async function classifyTurn(input: string, config: ModelConfig, task: Del
         return control;
     } catch (error) {
         signal?.throwIfAborted();
-        request.diagnostics.failure = timeout.aborted ? "timeout" : "intent_failed";
+        request.diagnostics.failure = "intent_failed";
         return { ...turnControl(input, "answer", revision), clarification: "本轮要求未能可靠识别。请明确是只需回答、检查启动，还是继续开发或验收；当前未启动新操作。" };
     } finally {
         request.diagnostics.durationMs = Date.now() - started;
@@ -156,7 +159,21 @@ export function controlToolRejection(control: TurnControl, name: string, args: R
     if (["answer", "stop"].includes(control.intent)) {
         return "本轮只回答，禁止工具执行";
     }
-    const readTools = ["list_files", "read_file", "read_image", "grep_search", "git_status", "git_diff", "recall_context", "current_time", "calculator", "read_skill_reference", "activate_skill"];
+    const readTools = [
+        "list_files",
+        "read_file",
+        "read_image",
+        "grep_search",
+        "git_status",
+        "git_diff",
+        "recall_context",
+        "current_time",
+        "calculator",
+        "read_skill_reference",
+        "activate_skill",
+        "todo_write",
+        "exit_plan_mode"
+    ];
     if (readTools.includes(name)) {
         return undefined;
     }
@@ -177,7 +194,7 @@ export function controlToolRejection(control: TurnControl, name: string, args: R
 }
 
 /** 过滤宿主控制记录，避免内部安排被供应商当作用户消息 */
-export function withoutRuntimeControl(messages: AgentMessage[]) {
+export function withoutRuntimeControl(messages: AgentMessage[]): Exclude<AgentMessage, RuntimeControlMessage>[] {
     return messages.filter((message): message is Exclude<AgentMessage, RuntimeControlMessage> => message.role !== "runtime_control");
 }
 

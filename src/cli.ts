@@ -18,6 +18,7 @@ import { skillRegistry } from "./agent/skills/registry";
 import { turnHistoryManager } from "./cli/turn-history";
 import type { AgentRunResult } from "./agent/types";
 import type { VerificationOptions } from "./agent/acceptance/types";
+import type { PlanReviewResult } from "./agent/plan/exit-plan.tool";
 
 /** 检测异常是否为 Ctrl+C 中断引发的取消错误 */
 function isAbortError(err: unknown): boolean {
@@ -77,6 +78,7 @@ async function startCli(): Promise<void> {
     }
 
     /** 越界或高危操作通过交互式上下键进行提权确认 */
+    /** 越界或高危操作通过交互式上下键进行提权确认 */
     const askUserPermission = async (promptText: string): Promise<boolean> => {
         const cleanPrompt = promptText.replace(/\x1b\[[0-9;]*m/g, "").replace(/\(y\/N\):.*/, "").trim();
 
@@ -92,6 +94,59 @@ async function startCli(): Promise<void> {
                 cleanPrompt || "越界沙箱操作授权确认"
             );
             return confirmed === true;
+        } finally {
+            liveInputManager.resume();
+            rollingTicker.resume();
+        }
+    };
+
+    /** 响应 exit_plan_mode 工具调用的审批门禁，挂起 Agent 循环并展示方案与选择面板 */
+    const reviewPlanInteractive = async (planMarkdown: string): Promise<PlanReviewResult> => {
+        rollingTicker.pause();
+        liveInputManager.pause();
+        try {
+            // 渲染规划方案审批门禁头部与正文
+            console.log(`\n${colors.cyan}╭──────────────────────── 规划方案审批门禁 (Plan Review Gate) ────────────────────────╮${colors.reset}\n`);
+            renderAssistantReply(planMarkdown, "completed");
+            console.log(`\n${colors.cyan}╰──────────────────────────────────────────────────────────────────────────────────────╯${colors.reset}\n`);
+
+            // 弹出两态决策菜单
+            const choice = await interactiveSelect<"approve" | "supplement">(
+                [
+                    {
+                        label: "Approve (批准实施)",
+                        value: "approve",
+                        hint: "解除只读沙箱锁定，授权 Agent 切入执行模式开始修改代码"
+                    },
+                    {
+                        label: "Keep Planning (打回修改)",
+                        value: "supplement",
+                        hint: "保持只读沙箱，输入反馈修改意见，指示 Agent 重新调研与调整方案"
+                    }
+                ],
+                "请对上述技术方案进行裁定"
+            );
+
+            if (choice === "approve") {
+                console.log(`\n${colors.green}✔ 已批准技术方案，只读沙箱锁定已解除。${colors.reset}\n`);
+                return { approved: true };
+            }
+
+            // 用户选择打回并输入反馈意见
+            console.log(`\n${colors.yellow}✎ 请输入对上述方案的修改意见与反馈：${colors.reset}`);
+            const feedbackInput = await interactivePrompt({
+                modelName: "方案反馈",
+                reasoningEffort: "high",
+                projectPath: currentProject.rootPath,
+                placeholder: "例如：请先不要重构权限模块，优先保持向后兼容..."
+            });
+
+            const feedback = feedbackInput.trim() || "方案未获批准，请根据要求重新设计。";
+            console.log(`\n${colors.yellow}已将反馈打回给 Agent，继续保持只读规划中...${colors.reset}\n`);
+            return {
+                approved: false,
+                feedback
+            };
         } finally {
             liveInputManager.resume();
             rollingTicker.resume();
@@ -124,7 +179,8 @@ async function startCli(): Promise<void> {
                 verification,
                 signal: activeController.signal,
                 onStep: renderLiveStep,
-                onAskPermission: askUserPermission
+                onAskPermission: askUserPermission,
+                onReviewPlan: reviewPlanInteractive
             });
         } finally {
             // 关闭执行期输入框并清理状态
@@ -152,22 +208,27 @@ async function startCli(): Promise<void> {
 
         // 3. 检查是否为 Agent 制定的方案并等待用户确认
         if (isPlanConfirmationPrompt(result.reply, isExplicitPlan)) {
-            const confirmation = await promptPlanConfirmation();
-            if (confirmation.action === "confirm") {
-                const followUpPrompt = "确认执行该修改，请立即调用相关工具落地方案。";
-                const followUpStart = Date.now();
-                const followUpResult = await chat(followUpPrompt);
-                const followUpDuration = Date.now() - followUpStart;
+            const isPlanStillActive = await sessionService.getPlanMode(currentSessionId);
+            if (isPlanStillActive) {
+                const confirmation = await promptPlanConfirmation();
+                if (confirmation.action === "confirm") {
+                    await sessionService.setPlanMode(currentSessionId, false);
+                    permissionManager.setMode("workspace");
+                    const followUpPrompt = "确认执行该修改，请立即调用相关工具落地方案。";
+                    const followUpStart = Date.now();
+                    const followUpResult = await chat(followUpPrompt);
+                    const followUpDuration = Date.now() - followUpStart;
 
-                // 递归流转执行后续阶段
-                await handleTurnCompletion(followUpResult, followUpDuration, false);
-            } else if (confirmation.action === "supplement" && confirmation.supplementText) {
-                const followUpStart = Date.now();
-                const followUpResult = await chat(confirmation.supplementText);
-                const followUpDuration = Date.now() - followUpStart;
+                    // 递归流转执行后续阶段
+                    await handleTurnCompletion(followUpResult, followUpDuration, false);
+                } else if (confirmation.action === "supplement" && confirmation.supplementText) {
+                    const followUpStart = Date.now();
+                    const followUpResult = await chat(confirmation.supplementText);
+                    const followUpDuration = Date.now() - followUpStart;
 
-                // 递归流转执行补充方案
-                await handleTurnCompletion(followUpResult, followUpDuration, false);
+                    // 递归流转执行补充方案
+                    await handleTurnCompletion(followUpResult, followUpDuration, false);
+                }
             }
         }
     };
@@ -278,13 +339,30 @@ async function startCli(): Promise<void> {
                 }
 
                 if (cmd === "/plan") {
-                    if (!cmdArg) {
-                        console.log(`\n${colors.yellow}用法: /plan <任务描述> - 显式启动规划模式，深入查阅代码并输出技术方案。${colors.reset}\n`);
+                    const subArg = cmdArg.trim().toLowerCase();
+                    if (subArg === "off" || subArg === "exit") {
+                        await sessionService.setPlanMode(currentSessionId, false);
+                        permissionManager.setMode("workspace");
+                        console.log(`\n${colors.green}✔ 已退出 Plan 规划模式，恢复正常工作区执行模式。${colors.reset}\n`);
                         continue;
                     }
 
+                    if (!cmdArg) {
+                        const isCurrentPlan = await sessionService.getPlanMode(currentSessionId);
+                        if (isCurrentPlan) {
+                            console.log(`\n${colors.cyan}当前会话正处于 PLAN 规划模式中。输入 /plan off 可退出。${colors.reset}\n`);
+                        } else {
+                            console.log(`\n${colors.yellow}用法: /plan <任务描述> - 启动规划模式并持久化会话状态；/plan off - 退出规划模式。${colors.reset}\n`);
+                        }
+                        continue;
+                    }
+
+                    // 激活持久化 Plan 模式并设置只读权限
+                    await sessionService.setPlanMode(currentSessionId, true);
+                    permissionManager.setMode("read-only");
+
                     // 构造严格的 Planning 模式 Prompt，引导只读分析与产出方案
-                    const planPrompt = `【PLANNING 规划模式】请针对以下任务进行深入分析与调研规划。在此模式下，请仅使用只读工具（如 list_files, read_file, grep_search, git_status 等）查阅代码，切勿执行任何写操作或修改代码。请输出一份条理清晰、步骤明确的完整技术实施方案：\n\n${cmdArg}`;
+                    const planPrompt = `【PLANNING 规划模式】请针对以下任务进行深入分析与调研规划。在此模式下，请仅使用只读工具查阅代码，切勿执行任何写操作或修改代码。完成调研后必须调用 exit_plan_mode 工具提交技术方案：\n\n${cmdArg}`;
 
                     console.log(`\n${colors.bold}● Plan: ${cmdArg}${colors.reset}\n`);
 
@@ -293,7 +371,7 @@ async function startCli(): Promise<void> {
                     const result = await chat(planPrompt);
                     const turnDuration = Date.now() - turnStart;
 
-                    // 渲染方案回复并自动弹出确认弹窗
+                    // 渲染方案回复并自动处理流转
                     await handleTurnCompletion(result, turnDuration, true);
                     continue;
                 }

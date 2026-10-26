@@ -4,11 +4,13 @@ import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { generationPolicy, type GenerationPolicy } from "../agent/runtime/generation-policy";
 import { parseModelOverrides, resolveProvider, type LlmProvider, type ModelOverride } from "../agent/runtime/model-profile";
+import { parallelToolLimit } from "../agent/runtime/tool-batch";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface AppConfig {
     port: number;
+    maxParallelToolCalls: number;
     context: { windowTokens: number; windowExplicit: boolean; compactionEnabled: boolean };
     llm: GenerationPolicy & {
         baseUrl: string;
@@ -66,6 +68,7 @@ export function getAppConfig(): AppConfig {
 
     return {
         port,
+        maxParallelToolCalls: parallelToolLimit(),
         context: {
             windowTokens,
             windowExplicit: process.env.LLM_CONTEXT_WINDOW_TOKENS !== undefined,

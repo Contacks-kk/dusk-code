@@ -24,15 +24,12 @@ export function toolText(value: unknown): string | undefined {
     return typeof value === "string" ? value : undefined;
 }
 
-/** 判断技能、图片与命令工具是否返回失败 */
+/** 判断工具返回是否包含失败状态 */
 export function isManagedToolFailure(name: string, result: unknown): boolean {
-    if (!["activate_skill", "read_skill_reference", "read_image", "execute_command", "managed_process", "browser_action", "test_mail", "apply_patch", "write_file"].includes(name)) {
-        return false;
-    }
     const details = readToolDetails(result);
     if (["managed_process", "browser_action", "test_mail"].includes(name)) {
         return Boolean(details?.error || details?.timedOut || details?.aborted || details?.completed === false);
     }
-    return Boolean(details?.success === false || details?.error || details?.timedOut || details?.aborted ||
+    return Boolean(details?.success === false || details?.error || details?.outputStorageError || details?.timedOut || details?.aborted ||
         (name === "execute_command" && details?.exitCode !== undefined && details.exitCode !== 0));
 }

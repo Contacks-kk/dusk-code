@@ -35,12 +35,15 @@ import { classifyTurn, explicitControl, turnControl, executionPolicy, type TurnC
 import { ActiveRun, type PendingInput } from "../agent/runtime/active-run";
 import { TaskStore, taskFacts } from "../agent/acceptance/task-store";
 import { TaskStatusBarTracker } from "../agent/status/tracker";
+import { createTodoWriteTool } from "../agent/status/todo.tool";
+import { createExitPlanModeTool, type PlanReviewHandler } from "../agent/plan/exit-plan.tool";
 import type { TaskStatus } from "../agent/types";
 
 interface ChatOptions {
     projectId?: number;
     onStep?: (step: AgentExecutionStep) => void;
     onAskPermission?: (prompt: string) => Promise<boolean>;
+    onReviewPlan?: PlanReviewHandler;
     imagePaths?: string[];
     signal?: AbortSignal;
     verification?: VerificationOptions;
@@ -482,7 +485,24 @@ export class AgentService {
                 opts.onActive?.({ sessionId: targetSession.id, runId: opts.runtime.runId });
             }
 
-            // 5. 每轮快照模型配置，重试沿用同一权限、输入与预算策略
+            // 5. 判定并维护会话级持久化计划模式
+            let isPlanMode = await sessionService.getPlanMode(targetSession.id);
+            const trimmedInput = userInput.trim();
+
+            // 检测显式退出计划模式
+            if (/^(?:\/plan\s+off|\/plan\s+exit|退出计划模式|关闭计划模式)[。！!\s]*$/i.test(trimmedInput)) {
+                await sessionService.setPlanMode(targetSession.id, false);
+                permissionManager.setMode("workspace");
+                isPlanMode = false;
+            } else if (/^(?:\/plan|进入计划模式|开启计划模式)(?:\s+.*)?$/i.test(trimmedInput) || trimmedInput.startsWith("【PLANNING")) {
+                await sessionService.setPlanMode(targetSession.id, true);
+                isPlanMode = true;
+            }
+
+            // 若处于计划模式，强制锁定只读权限沙箱
+            if (isPlanMode) {
+                permissionManager.setMode("read-only");
+            }
             const currentPermissionMode = permissionManager.getMode();
             const currentProject = targetSession.projectId ? await projectService.getProjectById(targetSession.projectId) : undefined;
             const projectRoot = currentProject?.rootPath ?? process.cwd();
@@ -497,6 +517,13 @@ export class AgentService {
                     value => auxiliaryRequests.push(value), opts.signal, revision));
             control.userMessageRef = `m:${userMessage.id}`;
             control.taskId = previous?.taskId;
+
+            // 计划模式下强制收敛意图为 plan，禁止验收与写工具
+            if (isPlanMode) {
+                control.intent = "plan";
+                control.scope = "none";
+                control.allowVerification = false;
+            }
             if (opts.verification?.mode === "only" && !["answer", "stop"].includes(control.intent)) {
                 control.intent = "verify";
                 control.scope = "contract";
@@ -521,7 +548,8 @@ export class AgentService {
                 projectRoot,
                 (previous?.contract.originalInput ?? userInput).slice(0, 300),
                 "replace",
-                executionPolicy().runMs
+                executionPolicy().runMs,
+                control.intent
             );
 
             /** 从宿主状态生成终端及SSE共用的进度 */
@@ -636,7 +664,11 @@ export class AgentService {
             await acceptance.initialize();
             skillRuntime.requireVisual(control.scope !== "startup" && delivery.contract.kind === "implement" && delivery.status !== "not_required" &&
                 delivery.contract.outputs.some(output => output.startsWith("ui-")));
-            const systemPrompt = buildSystemPrompt({ permissionMode: currentPermissionMode, skillCatalog: skillRuntime.registry.generatePromptCatalog() }) +
+            const systemPrompt = buildSystemPrompt({
+                permissionMode: currentPermissionMode,
+                skillCatalog: skillRuntime.registry.generatePromptCatalog(),
+                isPlanMode
+            }) +
                 `\n目标项目工作目录：${projectRoot}。文件操作使用该目录下的路径，命令的 cwd 明确使用该目录。` +
                 (rawHistory.some(item => item.turn.executionJson?.pendingToolCallIds?.length) ?
                     "\n此前有结果未知的工具操作，先读取源码、日志或已有证据核实实际状态，不得直接重放这些副作用。" : "");
@@ -682,6 +714,7 @@ export class AgentService {
             };
 
             const runner = new AgentRunner({
+                maxParallelToolCalls: config.maxParallelToolCalls,
                 control,
                 beforeAction: () => opts.runtime?.ready(opts.signal) ?? Promise.resolve(),
                 skillRuntime,
@@ -700,8 +733,22 @@ export class AgentService {
                 currentTurnId: createdTurn.id,
                 currentTurnNo: nextTurnNo,
                 userMessageId: userMessage.id,
-                tools: [...toolRegistry.getAll().filter(tool => tool.name !== "activate_skill" && tool.name !== "read_skill_reference"),
-                ...createSkillTools(skillRuntime), ...createAcceptanceTools(acceptance), createRecallTool(contextStore)],
+                tools: [
+                    ...toolRegistry.getAll().filter(tool => tool.name !== "activate_skill" && tool.name !== "read_skill_reference"),
+                    ...createSkillTools(skillRuntime),
+                    ...createAcceptanceTools(acceptance),
+                    createRecallTool(contextStore),
+                    createTodoWriteTool(statusBarTracker),
+                    ...(isPlanMode ? [
+                        createExitPlanModeTool({
+                            onReviewPlan: opts.onReviewPlan,
+                            onApprove: async () => {
+                                await sessionService.setPlanMode(targetSession.id, false);
+                                permissionManager.setMode("workspace");
+                            }
+                        })
+                    ] : [])
+                ],
                 maxTokens: modelConfig.maxTokens,
                 retryMaxTokens: modelConfig.retryMaxTokens,
                 generationTimeoutMs: modelConfig.generationTimeoutMs,

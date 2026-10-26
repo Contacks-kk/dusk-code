@@ -215,9 +215,8 @@ export function renderLiveStep(step: AgentExecutionStep): void {
         rollingTicker.setStage("正在准备工具调用");
         turnHistoryManager.recordIntermediateText(turnNo, step.content ?? "");
         const md = renderMarkdown(step.content ?? "");
-        turnHistoryManager.recordOutputLines(countScreenLines(md) + 3);
-        console.log(`\n${colors.gray}•${colors.reset}\n`);
-        console.log(md);
+        turnHistoryManager.recordOutputLines(countScreenLines(md) + 1);
+        console.log(`\n${md}`);
     } else if (step.type === "tool_call") {
         rollingTicker.setStage(`正在执行 ${step.toolName || "工具"}`);
         turnHistoryManager.recordToolCall(turnNo, {
@@ -257,14 +256,13 @@ export function renderLiveStep(step: AgentExecutionStep): void {
 /** 用普通正文展示最终回复与执行状态 */
 export function renderAssistantReply(content: string, status?: RunStatus): void {
     rollingTicker.flush();
-    const label = status && status !== "completed" ? ` [${status}]` : "";
+    const label = status && status !== "completed" ? `${colors.gray}本轮状态：${status}${colors.reset}\n\n` : "";
     const md = renderMarkdown(content || "本轮没有可显示的回复，请查看执行状态。");
-    turnHistoryManager.recordOutputLines(countScreenLines(md) + 3);
-    console.log(`\n${colors.gray}•${label}${colors.reset}\n`);
-    console.log(md);
+    turnHistoryManager.recordOutputLines(countScreenLines(md) + (label ? 3 : 1));
+    console.log(`\n${label}${md}`);
 }
 
-/** 打印启动 Banner 与控制台看板 */
+/** 打印简洁的模型、目录和会话信息 */
 export function printHeaderBanner(info: {
     projectName: string;
     projectPath: string;
@@ -276,18 +274,17 @@ export function printHeaderBanner(info: {
 }): void {
     const permBadge = formatPermissionBadge(info.permissionMode);
     const sessionText = info.sessionId ? `#${info.sessionId}` : "(未创建，首次发送自动生成)";
-    const modelText = `${colors.bold}${info.modelName || "deepseek-chat"}${colors.reset} ${colors.gray}(${info.reasoningDisplay ?? reasoningLabel(info.modelName || "deepseek-chat", info.reasoningEffort || "high")})${colors.cyan}`;
+    const modelText = `${info.modelName || "deepseek-chat"} ${colors.gray}(${info.reasoningDisplay ?? reasoningLabel(info.modelName || "deepseek-chat", info.reasoningEffort || "high")})${colors.reset}`;
 
-    const width = Math.min(90, getTerminalWidth());
+    const width = Math.min(80, getTerminalWidth());
     const content = [
-        `${colors.bold}✦ DUSK CLI${colors.reset}  ${colors.gray}Autonomous Code Agent${colors.reset}`,
+        `${colors.bold}>_ Dusk CLI${colors.reset}`,
         "",
-        `${colors.white}Project :${colors.reset} ${colors.bold}${info.projectName}${colors.reset} ${colors.gray}(${info.projectPath})${colors.reset}`,
-        `${colors.white}Session :${colors.reset} ${colors.magenta}${sessionText}${colors.reset}`,
-        `${colors.white}Model   :${colors.reset} ${modelText}${colors.reset}`,
-        `${colors.white}Security:${colors.reset} ${permBadge}`,
+        `${colors.gray}模型  ${colors.reset}${modelText}`,
+        `${colors.gray}目录  ${colors.reset}${info.projectPath}`,
+        `${colors.gray}会话  ${sessionText} · ${colors.reset}${permBadge}`,
         "",
-        `${colors.gray}常用指令: /help · /image · /model · /plan · /turn · /permissions · /compact · exit${colors.reset}`
+        `${colors.gray}/help 查看指令 · /turn 查看执行详情${colors.reset}`
     ];
     if (width < 8) {
         console.log(content.flatMap(line => wrapTerminalText(line, width)).join("\n"));
@@ -297,9 +294,9 @@ export function printHeaderBanner(info: {
     // 所有边框行使用相同的显示宽度，长路径与中文提示在框内折行
     const innerWidth = width - 4;
     const rows = content.flatMap(line => wrapTerminalText(line, innerWidth)).map(line =>
-        `${colors.cyan}│${colors.reset} ${line}${" ".repeat(Math.max(0, innerWidth - stringWidth(line)))} ${colors.cyan}│${colors.reset}`
+        `${colors.gray}│${colors.reset} ${line}${" ".repeat(Math.max(0, innerWidth - stringWidth(line)))} ${colors.gray}│${colors.reset}`
     );
-    console.log(`\n${colors.cyan}╭${"─".repeat(width - 2)}╮${colors.reset}\n${rows.join("\n")}\n${colors.cyan}╰${"─".repeat(width - 2)}╯${colors.reset}\n`);
+    console.log(`\n${colors.gray}╭${"─".repeat(width - 2)}╮${colors.reset}\n${rows.join("\n")}\n${colors.gray}╰${"─".repeat(width - 2)}╯${colors.reset}\n`);
 }
 
 /** 打印图片附件提示标签 */
@@ -321,7 +318,7 @@ ${colors.cyan}${colors.bold}DUSK CLI 命令指引${colors.reset}
 
   ${colors.yellow}/image [路径] [任务]${colors.reset}    附加本地图片或自动提取剪贴板截图进行视图分析
   ${colors.yellow}/model [name] [effort]${colors.reset} 切换语言模型与推理等级: xhigh | high | medium | low | off
-  ${colors.yellow}/plan <任务需求>${colors.reset}        显式进入规划模式，深入只读调研代码并输出实施计划
+  ${colors.yellow}/plan [需求] | off${colors.reset}    持久化进入规划模式只读调研架构并审批；/plan off 退出
   ${colors.yellow}/skill [name]${colors.reset}           查看技能；指定名称后固定到当前会话
   ${colors.yellow}/skill off <name> | clear${colors.reset}  关闭技能，或清除手动设置并恢复自动选择
   ${colors.yellow}/verify [taskId]${colors.reset}        继续最近未完成的验收，保留实际证据与缺口

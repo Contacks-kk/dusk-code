@@ -36,7 +36,9 @@ export const READ_TOOLS = new Set([
     "git_diff",
     "get_current_time",
     "calculator",
-    "recall_context"
+    "recall_context",
+    "todo_write",
+    "exit_plan_mode"
 ]);
 
 /** 按具体动作判断验收工具是否只观察已有资源 */

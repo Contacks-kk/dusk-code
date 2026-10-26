@@ -34,7 +34,12 @@ export function migrateDatabase(database: Database.Database): void {
         if (!columns("session").includes("skill_state_json")) {
             database.exec(`ALTER TABLE session ADD COLUMN skill_state_json TEXT NOT NULL DEFAULT '{"pinned":[],"disabled":[]}'`);
         }
-        if (!columns("turn").includes("execution_json")) database.exec("ALTER TABLE turn ADD COLUMN execution_json TEXT");
+        if (!columns("session").includes("plan_mode")) {
+            database.exec("ALTER TABLE session ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!columns("turn").includes("execution_json")) {
+            database.exec("ALTER TABLE turn ADD COLUMN execution_json TEXT");
+        }
         database.exec(`CREATE TABLE IF NOT EXISTS context_artifact (
             id TEXT PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES session(id),
             payload_json TEXT NOT NULL, created_at INTEGER NOT NULL

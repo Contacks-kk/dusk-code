@@ -3,6 +3,14 @@ export interface SpillConfig {
     maxInlineLines: number;
     headLines: number;
     tailLines: number;
+    maxDetailsBytes?: number;
+}
+
+export interface CommandOutputContext {
+    sessionId: number;
+    projectRoot: string;
+    toolName: string;
+    toolCallId: string;
 }
 
 export interface SpillSaveRequest {
@@ -11,6 +19,7 @@ export interface SpillSaveRequest {
     toolCallId: string;
     content: string;
     projectRoot: string;
+    source?: "result" | "details";
 }
 
 export interface SpillRef {
@@ -22,4 +31,6 @@ export interface SpillRef {
     omittedBytes: number;
     omittedLines: number;
     retrievalHint: string;
+    source?: "result" | "details" | "stdout" | "stderr";
+    complete?: boolean;
 }

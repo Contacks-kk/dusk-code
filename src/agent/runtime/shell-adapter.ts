@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { createCommandOutput } from "./command-output";
+import type { CommandOutputContext } from "../spill/types";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -9,6 +12,28 @@ export interface CommandExecutionResult {
     timedOut: boolean;
     aborted: boolean;
     outputIncomplete: boolean;
+    stdoutPath?: string;
+    stderrPath?: string;
+    stdoutBytes?: number;
+    stderrBytes?: number;
+    outputTruncated?: boolean;
+    outputStorageError?: string;
+    operationStarted?: boolean;
+}
+
+/** 提取命令归档信息及输出完整性标记 */
+export function commandOutputDetails(result: CommandExecutionResult) {
+    return {
+        stdoutPath: result.stdoutPath,
+        stderrPath: result.stderrPath,
+        stdoutBytes: result.stdoutBytes,
+        stderrBytes: result.stderrBytes,
+        outputTruncated: result.outputTruncated,
+        outputStorageError: result.outputStorageError,
+        operationStarted: result.operationStarted,
+        outputIncomplete: result.outputIncomplete,
+        ...(result.outputStorageError ? { error: `输出归档失败：${result.outputStorageError}；请先核实已执行操作，不得重放` } : {})
+    };
 }
 
 /** 跨平台终端执行与命令安全防护适配器 */
@@ -60,22 +85,13 @@ try {
         }
     }
 
-    /** 智能截断输出以防撑爆模型上下文 */
-    private sanitizeOutput(raw: string, maxLen: number = 3000): string {
-        const text = raw.trim();
-        if (text.length <= maxLen) {
-            return text;
-        }
-        const truncatedNotice = `\n...[输出过长，已自动截断后部 ${text.length - maxLen} 个字符]...`;
-        return text.slice(0, maxLen) + truncatedNotice;
-    }
-
     /** 根据当前操作系统环境执行终端命令并返回安全格式化结果 */
     public async execute(
         command: string,
         cwd: string = process.cwd(),
         timeoutMs: number = 30000,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        outputContext?: CommandOutputContext
     ): Promise<CommandExecutionResult> {
         this.validateCommandSafety(command);
 
@@ -92,6 +108,18 @@ try {
 
         const targetCwd = path.isAbsolute(cwd) ? cwd : path.resolve(process.cwd(), cwd);
 
+        const output = await createCommandOutput(outputContext ?? {
+            projectRoot: targetCwd,
+            sessionId: 0,
+            toolName: "command",
+            toolCallId: randomUUID()
+        });
+        if (signal?.aborted) {
+            output.stdout.end();
+            output.stderr.end();
+            await Promise.all([output.stdout.completion, output.stderr.completion]);
+            return { stdout: "", stderr: "", exitCode: -1, timedOut: false, aborted: true, outputIncomplete: false, operationStarted: false };
+        }
         return new Promise<CommandExecutionResult>((resolve) => {
             let shellProgram: string;
             let shellArgs: string[];
@@ -107,14 +135,29 @@ try {
                 shellArgs = ["-c", command];
             }
 
-            const proc = spawn(shellProgram, shellArgs, {
-                cwd: targetCwd,
-                env: { ...process.env, LANG: "zh_CN.UTF-8" },
-                windowsHide: true
-            });
+            let proc: ReturnType<typeof spawn>;
+            try {
+                proc = spawn(shellProgram, shellArgs, {
+                    cwd: targetCwd,
+                    env: { ...process.env, LANG: "zh_CN.UTF-8" },
+                    windowsHide: true
+                });
+            } catch (error) {
+                output.stdout.end();
+                output.stderr.end();
+                void Promise.all([output.stdout.completion, output.stderr.completion]).then(() => resolve({
+                    stdout: "",
+                    stderr: `进程未启动：${error instanceof Error ? error.message : String(error)}`,
+                    exitCode: -1,
+                    timedOut: false,
+                    aborted: false,
+                    outputIncomplete: false,
+                    operationStarted: false
+                }));
+                return;
+            }
 
-            let stdout = "";
-            let stderr = "";
+            let lifecycleError = "";
             let timedOut = false;
             let aborted = false;
             let exited = false;
@@ -124,7 +167,7 @@ try {
             let drainTimer: ReturnType<typeof setTimeout> | undefined;
 
             /** 清理本次命令的等待资源并只返回一次结果 */
-            const finish = (outputIncomplete: boolean = false): void => {
+            const finish = async (outputIncomplete: boolean = false): Promise<void> => {
                 if (settled) {
                     return;
                 }
@@ -133,38 +176,51 @@ try {
                 clearTimeout(drainTimer);
                 signal?.removeEventListener("abort", onAbort);
 
-                // 后台进程可能仍持有管道，结束等待时只释放当前执行器的句柄
+                // 停止接收新字节后，等待已采集字节落盘
+                proc.stdout.unpipe(output.stdout);
+                proc.stderr.unpipe(output.stderr);
                 proc.stdin?.destroy();
                 proc.stdout.destroy();
                 proc.stderr.destroy();
+                output.stdout.end();
+                output.stderr.end();
                 proc.unref();
+                await Promise.all([output.stdout.completion, output.stderr.completion]);
+                const storageError = output.stdout.storageError ?? output.stderr.storageError;
                 resolve({
-                    stdout: this.sanitizeOutput(stdout),
-                    stderr: this.sanitizeOutput(stderr),
+                    stdout: output.stdout.preview(),
+                    stderr: output.stderr.preview() + lifecycleError,
+                    stdoutPath: output.stdout.filename,
+                    stderrPath: output.stderr.filename,
+                    stdoutBytes: output.stdout.totalBytes,
+                    stderrBytes: output.stderr.totalBytes,
+                    outputTruncated: output.stdout.totalBytes > 12000 || output.stderr.totalBytes > 12000,
+                    outputStorageError: storageError,
+                    operationStarted: Boolean(proc.pid),
                     exitCode,
                     timedOut,
                     aborted,
-                    outputIncomplete
+                    outputIncomplete: outputIncomplete || Boolean(storageError)
                 });
             };
 
             /** 尝试终止当前命令并结束超时或取消等待 */
-            const stop = (cancelled: boolean): void => {
+            const stop = (cancelled: boolean, storageFailure = false): void => {
                 if (settled) {
                     return;
                 }
                 aborted = cancelled;
-                timedOut = !cancelled;
+                timedOut = !cancelled && !storageFailure;
 
                 // Shell 已退出时保留后台进程，仅停止回收剩余输出
                 if (!exited) {
                     try {
                         if (!proc.kill()) {
-                            stderr += "\n未能确认命令进程已终止，子进程可能仍在运行。";
+                            lifecycleError += "\n未能确认命令进程已终止，子进程可能仍在运行。";
                         }
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
-                        stderr += `\n终止命令进程失败: ${message}`;
+                        lifecycleError += `\n终止命令进程失败: ${message}`;
                     }
                 }
 
@@ -177,13 +233,17 @@ try {
                 stop(true);
             };
 
-            proc.stdout.on("data", (chunk) => {
-                stdout += chunk.toString();
-            });
-
-            proc.stderr.on("data", (chunk) => {
-                stderr += chunk.toString();
-            });
+            /** 存盘失败时停止命令，并保留已执行状态 */
+            const outputFailed = (error: Error): void => {
+                lifecycleError += `\n输出存盘失败：${error.message}；命令可能已产生副作用，不得直接重放。`;
+                stop(false, true);
+            };
+            output.stdout.on("error", outputFailed);
+            output.stderr.on("error", outputFailed);
+            proc.stdout.on("error", outputFailed);
+            proc.stderr.on("error", outputFailed);
+            proc.stdout.pipe(output.stdout);
+            proc.stderr.pipe(output.stderr);
 
             proc.once("exit", (code) => {
                 if (settled) {
@@ -209,7 +269,7 @@ try {
                 if (settled) {
                     return;
                 }
-                stderr += `\n进程执行失败: ${err.message}`;
+                lifecycleError += `\n进程执行失败: ${err.message}`;
 
                 // 终止进程产生的错误由超时或取消分支统一收尾
                 if (!timedOut && !aborted) {

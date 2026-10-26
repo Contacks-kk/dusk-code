@@ -8,6 +8,7 @@ export const session = sqliteTable("session", {
     projectId: integer("project_id").references(() => project.id),
     title: text("title", { length: 255 }),
     skillStateJson: text("skill_state_json", { mode: "json" }).$type<SessionSkillState>().notNull().default({ pinned: [], disabled: [] }),
+    planMode: integer("plan_mode").notNull().default(0),
     createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
     updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date())
 });

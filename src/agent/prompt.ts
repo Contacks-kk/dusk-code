@@ -14,8 +14,8 @@ const BASE_TOOLBOX_SPEC = `【工具箱分类与调用规范】
    - \`activate_skill\`: 遇到专业领域任务时（如前端审美优化、代码审查、Bug修复、代码库阅读、头脑风暴等），按需激活加载技能的执行规约与工作流。
    - \`read_skill_reference\`: 查阅已激活技能所配套的专业参考手册（如多语言编码标准、UI美学指南等）。
 2. 变更落实类工具：
-   - \`apply_patch\`: 【优先推荐】基于一段精确的旧代码替换为新代码，避免重写整个文件造成 Token 损耗。
-   - \`write_file\`: 用于新建文件，或文件被全量重构且无法精准局部匹配时使用。
+   - \`apply_patch\`: 【优先推荐】基于一段精确的旧代码替换为新代码，避免重写整个文件造成 Token 损耗。修改已有代码前必须先使用 \`read_file\` 查阅过真实源码。
+   - \`write_file\`: 用于新建文件，或文件被全量重构且无法精准局部匹配时使用。若目标文件已存在，必须先使用 \`read_file\` 查阅源码。
    - \`execute_command\`: 在受控终端运行构建、依赖检查或测试等命令（严禁破坏性指令）。`;
 
 /** 根据指定权限模式生成对应的执行策略与交互规范提示词片段 */
@@ -56,14 +56,24 @@ function buildWorkflowPolicy(mode: PermissionMode): string {
   3. 修改完成后，可自主调用只读工具审查变更，并向用户简明汇报修改结果。`;
 }
 
+/** 生成计划模式专用提示词策略 */
+function buildPlanModePolicy(): string {
+    return `【当前系统处于：PLAN 规划设计模式（只读架构设计阶段）】
+你当前正处于严格的计划规划阶段。在此模式下：
+1. 【沙箱只读锁定】：底层权限沙箱已强制进入只读锁定，任何 write_file、apply_patch、edit_code 以及执行命令都会被硬性拦截并抛出错误！严禁尝试修改任何源代码！
+2. 【只读代码探索】：你应仅使用只读探索工具（如 list_files, grep_search, read_file, git_status 等）深入分析现有代码架构、查找引用、理清依赖与设计实现步骤。
+3. 【审批门禁】：规划完毕后，你必须调用 \`exit_plan_mode\` 工具提交完整的 Markdown 实施规划方案。该工具将挂起执行并唤起用户审批门禁；只有用户审批通过后系统才会解锁写权限。未获批准前，你不得声称已完成或尝试直接编码。`;
+}
+
 /** 动态编织系统级工程提示词，支持根据权限模式及运行环境动态装配 */
 export function buildSystemPrompt(options: {
     permissionMode?: PermissionMode;
     projectRoot?: string;
     skillCatalog?: string;
+    isPlanMode?: boolean;
 } = {}): string {
     const mode = options.permissionMode || "workspace";
-    const workflow = buildWorkflowPolicy(mode);
+    const workflow = options.isPlanMode ? buildPlanModePolicy() : buildWorkflowPolicy(mode);
 
     // 动态提取当前已注册的技能目录清单
     const skillCatalog = options.skillCatalog ?? skillRegistry.generatePromptCatalog();

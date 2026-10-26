@@ -27,6 +27,16 @@ async function searchInFiles(
     maxResults: number = 40
 ): Promise<MatchItem[]> {
     const results: MatchItem[] = [];
+    const target = await fs.stat(dir);
+    if (target.isFile()) {
+        const lines = (await fs.readFile(dir, "utf8")).split(/\r?\n/);
+        for (let index = 0; index < lines.length && results.length < maxResults; index++) {
+            if (matcher.test(lines[index])) {
+                results.push({ filePath: path.relative(baseDir, dir), lineNumber: index + 1, lineContent: lines[index].trim() });
+            }
+        }
+        return results;
+    }
     const entries = await fs.readdir(dir, { withFileTypes: true });
 
     for (const entry of entries) {

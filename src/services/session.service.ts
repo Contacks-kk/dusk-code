@@ -16,6 +16,30 @@ export class SessionService {
         }
     }
 
+    /** 获取会话持久化的计划模式状态 */
+    public async getPlanMode(sessionId: number): Promise<boolean> {
+        // 读取指定会话记录
+        const found = db.select({ planMode: session.planMode })
+            .from(session)
+            .where(eq(session.id, sessionId))
+            .get();
+
+        return (found?.planMode ?? 0) === 1;
+    }
+
+    /** 设置会话持久化的计划模式状态 */
+    public async setPlanMode(sessionId: number, active: boolean): Promise<void> {
+        // 更新会话计划模式标记与时间戳
+        const updated = db.update(session).set({
+            planMode: active ? 1 : 0,
+            updatedAt: new Date()
+        }).where(eq(session.id, sessionId)).returning({ id: session.id }).get();
+
+        if (!updated) {
+            throw new Error("会话不存在，无法更新计划模式状态");
+        }
+    }
+
     /** 创建新的对话会话并绑定所属工程 */
     public async createSession(title?: string, projectId?: number): Promise<Session> {
         const defaultTitle = title || "新对话";
